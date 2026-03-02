@@ -91,7 +91,7 @@ CONFIG = {
     "bed_detection_auto": True,         
     "bed_iou_threshold": 0.45,         
 
-    
+    #write your id and token of telegram
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "telegram_alert_cooldown": 60,     
