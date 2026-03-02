@@ -92,8 +92,8 @@ CONFIG = {
     "bed_iou_threshold": 0.45,         
 
     
-    "telegram_bot_token": "8674127158:AAGbh7doEbtch8jVV8cg1SOcq84i1PEjIiA",
-    "telegram_chat_id": "5659677216",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
     "telegram_alert_cooldown": 60,     
     "send_snapshot": True,            
 
