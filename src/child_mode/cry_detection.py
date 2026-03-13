@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║      INFANT CRY DETECTION & CLASSIFICATION  —  RASPBERRY PI                ║
+║      INFANT CRY DETECTION & CLASSIFICATION  —  RASPBERRY PI                  ║
 ║                                                                              ║
-║  Model Files Required (from cry_rpi_models.zip):                            ║
-║    config.json          — audio parameters & class names                    ║
-║    label_classes.npy    — cry class labels                                  ║
+║  Model Files Required (from cry_rpi_models.zip):                             ║
+║    config.json          — audio parameters & class names                     ║
+║    label_classes.npy    — cry class labels                                   ║
 ║    scaler.pkl           — StandardScaler for feature normalisation           ║
-║    pca.pkl              — PCA for dimensionality reduction                  ║
-║    ml_ensemble.pkl      — RF + XGBoost + LightGBM + SVM voting ensemble     ║
-║    ensemble_weights.npy — model blend weights                               ║
+║    pca.pkl              — PCA for dimensionality reduction                   ║
+║    ml_ensemble.pkl      — RF + XGBoost + LightGBM + SVM voting ensemble      ║
+║    ensemble_weights.npy — model blend weights                                ║
 ║                                                                              ║
-║  Telegram Alerts: instant message + audio clip on every cry detection       ║
+║  Telegram Alerts: instant message + audio clip on every cry detection        ║
 ║                                                                              ║
 ║  INSTALL (one-time on Raspberry Pi):                                         ║
 ║    pip3 install librosa numpy joblib scikit-learn requests soundfile         ║
-║    pip3 install xgboost lightgbm pyaudio                                    ║
+║    pip3 install xgboost lightgbm pyaudio                                     ║
 ║                                                                              ║
 ║  USAGE:                                                                      ║
 ║    python3 Cry_Detection_Classification.py              (live mic)           ║
