@@ -92,8 +92,8 @@ CONFIG = {
     "bed_iou_threshold": 0.45,         
 
     #write your id and token of telegram
-    "telegram_bot_token": "REMOVED",
-    "telegram_chat_id": "5659677216",
+    "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "telegram_alert_cooldown": 60,     
     "send_snapshot": True,            
 
