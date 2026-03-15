@@ -92,8 +92,8 @@ CONFIG = {
     "bed_iou_threshold": 0.45,         
 
     #write your id and token of telegram
-    "telegram_bot_token": "",
-    "telegram_chat_id": "",
+    "telegram_bot_token": "REMOVED",
+    "telegram_chat_id": "5659677216",
     "telegram_alert_cooldown": 60,     
     "send_snapshot": True,            
 
@@ -688,7 +688,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["frame_width"])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["frame_height"])
     cap.set(cv2.CAP_PROP_FPS, CONFIG["fps_target"])
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
         log.error("Cannot open camera!")
@@ -739,6 +739,118 @@ def main():
     cv2.destroyAllWindows()
     log.info("System stopped.")
 
+
+'''
+def main():
+    log.info("=" * 60)
+    log.info("  Advanced Fall Detection System — Starting")
+    log.info("=" * 60)
+
+    # Force V4L2 backend for Raspberry Pi camera compatibility
+    os.environ['OPENCV_VIDEOIO_PRIORITY_LIST'] = 'V4L2'
+    os.environ['OPENCV_VIDEOIO_V4L2_PRIORITY_LIST'] = 'V4L2'
+    
+    detector = FallDetector(CONFIG)
+
+    # ================= MODIFIED CAMERA OPENING CODE =================
+    # Try multiple backends and indices for better compatibility
+    camera_opened = False
+    camera_backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+    camera_indices = [CONFIG["camera_index"], 0, 1, -1]
+    
+    for backend in camera_backends:
+        for idx in camera_indices:
+            backend_name = "V4L2" if backend == cv2.CAP_V4L2 else "DEFAULT"
+            log.info(f"Trying camera index {idx} with {backend_name} backend...")
+            
+            cap = cv2.VideoCapture(idx, backend)
+            
+            if cap.isOpened():
+                # Set camera properties
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["frame_width"])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["frame_height"])
+                cap.set(cv2.CAP_PROP_FPS, CONFIG["fps_target"])
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # Verify settings worked
+                actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                
+                if actual_width > 0 and actual_height > 0:
+                    camera_opened = True
+                    log.info(f"✅ Camera opened successfully with {backend_name} backend at index {idx}")
+                    log.info(f"   Resolution: {actual_width}x{actual_height} @ {actual_fps:.1f}fps")
+                    break
+                else:
+                    cap.release()
+            else:
+                log.warning(f"❌ Failed with index {idx} and {backend_name} backend")
+        
+        if camera_opened:
+            break
+    
+    if not camera_opened:
+        log.error("❌ CRITICAL: Could not open camera with any backend or index!")
+        log.error("   Please check:")
+        log.error("   - Camera is connected: lsusb")
+        log.error("   - Camera device exists: ls -la /dev/video*")
+        log.error("   - Permissions: sudo usermod -a -G video $USER")
+        return
+    # ================= END OF MODIFIED CAMERA CODE =================
+
+    log.info(f"Camera opened: {CONFIG['frame_width']}x{CONFIG['frame_height']} @ {CONFIG['fps_target']}fps")
+    log.info("Press 'q' to quit | 'b' to mark bed zone manually | 'r' to reset tracks")
+
+    frame_times = deque(maxlen=30)
+    prev_time = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            log.warning("Frame grab failed, attempting to reconnect...")
+            cap.release()
+            time.sleep(1)
+            
+            # Try to reconnect
+            cap = cv2.VideoCapture(CONFIG["camera_index"], cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["frame_width"])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["frame_height"])
+            cap.set(cv2.CAP_PROP_FPS, CONFIG["fps_target"])
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            continue
+
+        now = time.time()
+        elapsed = now - prev_time
+        target_interval = 1.0 / CONFIG["fps_target"]
+        if elapsed < target_interval:
+            time.sleep(target_interval - elapsed)
+        prev_time = time.time()
+
+        t0 = time.perf_counter()
+        output = detector.process_frame(frame)
+        dt = time.perf_counter() - t0
+        frame_times.append(dt)
+        avg_fps = 1.0 / (sum(frame_times) / len(frame_times) + 1e-6)
+
+        cv2.putText(output, f"FPS: {avg_fps:.1f}", (output.shape[1]-100, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        if CONFIG["display_window"]:
+            cv2.imshow("Fall Detection System", output)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("r"):
+                detector.tracks.clear()
+                log.info("Tracks reset.")
+            elif key == ord("b"):
+                log.info("Manual bed zone: set 'bed_zone_manual' in CONFIG.")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    log.info("System stopped.")
+    '''
 
 if __name__ == "__main__":
     main()
