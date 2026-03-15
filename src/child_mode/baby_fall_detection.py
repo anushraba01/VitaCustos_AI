@@ -15,6 +15,9 @@ Architecture:
   │  Telegram Alert + Local Alarm                       │
   └─────────────────────────────────────────────────────┘
 
+  
+
+  
 Fall Detection Logic:
   - Torso angle deviation from vertical (>60°)
   - Sudden drop in hip/shoulder keypoint velocity
