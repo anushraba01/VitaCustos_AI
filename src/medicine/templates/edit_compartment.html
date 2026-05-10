@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Edit Medicine</h2>
+
+<form action="/update_compartment" method="POST">
+
+<input type="hidden" name="section_id" value="{{data[0]}}">
+
+<label>Medicine Name</label>
+<input type="text" name="medicine_name" value="{{data[1]}}">
+
+<label>Medicine Type</label>
+<input type="text" name="medicine_type" value="{{data[2]}}">
+
+<label>Servo Angle</label>
+<input type="number" name="servo_angle" value="{{data[3]}}">
+
+<label>Expiry Date</label>
+<input type="date" name="expiry_date" value="{{data[4]}}">
+
+<label>Quantity</label>
+<input type="number" name="current_quantity" value="{{data[5]}}">
+
+<button type="submit">Update Medicine</button>
+
+</form>
+
+{% endblock %}

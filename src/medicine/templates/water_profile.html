@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>💧 Water Profile</h2>
+
+{% if profile %}
+
+{% set user_id, age, gender, weight_kg, height_cm, activity_level = profile %}
+
+<div class="water-banner">
+    <div class="water-banner-left">
+        <span class="water-drop-icon">💧</span>
+        <div>
+            <p class="water-banner-label">Recommended daily intake</p>
+            <p class="water-banner-value">{{ recommended_ml }} ml
+                <span class="water-banner-liters">({{ "%.1f"|format(recommended_ml / 1000) }} L)</span>
+            </p>
+        </div>
+    </div>
+    <div class="water-banner-right">
+        <span class="alert-badge {% if config.alarm_enabled %}badge-on{% else %}badge-off{% endif %}">
+            🔔 Alerts {% if config.alarm_enabled %}ON{% else %}OFF{% endif %}
+        </span>
+        <span class="mode-badge">
+            {% if config.mode == 'custom' %}Doctor override{% else %}Smart mode{% endif %}
+        </span>
+        <br>
+        <a href="/edit_water_profile" class="edit-btn" style="margin-top:10px;display:inline-block;">Edit Profile</a>
+        <a href="/edit_water_alerts"  class="edit-btn" style="margin-top:10px;display:inline-block;">Edit Alerts</a>
+    </div>
+</div>
+
+<div class="water-profile-summary">
+    <span>👤 {{ age }} yrs</span>
+    <span>⚖️ {{ weight_kg }} kg</span>
+    <span>📏 {{ height_cm }} cm</span>
+    <span>🏃 {{ activity_level | capitalize }}</span>
+    <span>{{ '♂' if gender == 'male' else '♀' }} {{ gender | capitalize }}</span>
+</div>
+
+<h3 style="margin-top:30px;">⏰ Daily Hydration Schedule</h3>
+
+{% if config.mode == 'custom' %}
+<p class="water-info-note" style="margin-bottom:12px;">
+    Doctor / personal override active — each slot shows your set amount of
+    <strong>{{ config.doctor_ml_per_slot }} ml</strong>.
+    <a href="/edit_water_alerts">Change</a>
+</p>
+{% else %}
+<p class="water-info-note" style="margin-bottom:12px;">
+    Smart distribution based on circadian hydration research — amounts vary
+    across the day according to your body's natural fluid demand pattern.
+    <a href="/edit_water_alerts">Switch to custom</a>
+</p>
+{% endif %}
+
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Window</th>
+            <th>Amount</th>
+            <th>Alert</th>
+            <th>Why this amount?</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for slot in alert_slots %}
+        <tr>
+            <td><strong>{{ slot.time }}</strong></td>
+            <td>{{ slot.label }}</td>
+            <td><span class="ml-badge">{{ slot.ml }} ml</span></td>
+            <td>
+                {% if slot.enabled %}
+                    <span class="badge-on">ON</span>
+                {% else %}
+                    <span class="badge-off">OFF</span>
+                {% endif %}
+            </td>
+            <td class="reason-cell">{{ slot.reason }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="water-info-box">
+    <h3>How is the daily total calculated?</h3>
+    <ul>
+        <li><strong>Age 0–5:</strong> 100 ml/kg — WHO infant/toddler reference</li>
+        <li><strong>Age 65+:</strong> 30 ml/kg — ESPEN/EFSA geriatric guideline</li>
+        <li><strong>Adults:</strong> 35 ml/kg — standard clinical reference</li>
+        <li><strong>Light activity:</strong> no adjustment (sedentary / bed-rest)</li>
+        <li><strong>Moderate activity:</strong> +15%</li>
+        <li><strong>High activity:</strong> +30%</li>
+        <li><strong>Male:</strong> +200 ml (EFSA adequate intake difference)</li>
+    </ul>
+    <p class="water-info-note">
+        Time-slot distribution is based on circadian urine osmolality research
+        (Perrier et al., 2013). This is a recommendation only — use Edit Alerts
+        to apply your doctor's preferred amounts.
+    </p>
+</div>
+
+{% else %}
+
+<div class="water-empty">
+    <p class="water-empty-icon">💧</p>
+    <h3>No profile set up yet</h3>
+    <p>Add your physiological details to get a personalised daily water schedule.</p>
+    <a href="/edit_water_profile" class="btn-water-setup">Set Up Profile</a>
+</div>
+
+{% endif %}
+
+{% endblock %}

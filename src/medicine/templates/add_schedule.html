@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Add Medicine Schedule</h2>
+
+<div class="form-box">
+
+<form action="/insert_schedule" method="POST">
+
+<label>Section ID</label>
+<input type="text" name="section_id">
+
+<label>Time</label>
+<input type="time" name="time">
+
+<label>Dosage</label>
+<input type="number" name="dosage">
+
+<label>Before / After Food</label>
+<select name="before_after_food">
+<option>Before Food</option>
+<option>After Food</option>
+</select>
+
+<label>Water (ml)</label>
+<input type="number" name="water_ml">
+
+<button type="submit">Add Schedule</button>
+
+</form>
+
+</div>
+
+{% endblock %}

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<div class="dashboard">
+<h2>Welcome to Smart Medicine Box</h2>
+
+<div class="cards">
+
+<a href="/add_compartment" class="card">
+<h3>Add Medicine</h3>
+<p>Add medicine into compartment</p>
+</a>
+
+<a href="/view_compartment" class="card">
+<h3>View Medicines</h3>
+<p>Check all stored medicines</p>
+</a>
+
+<a href="/add_schedule" class="card">
+<h3>Add Schedule</h3>
+<p>Create medicine reminder</p>
+</a>
+
+<a href="/view_schedule" class="card">
+<h3>View Schedule</h3>
+<p>Check reminder schedule</p>
+</a>
+
+<a href="/water_profile" class="card card-water">
+<h3>💧 Water Profile</h3>
+<p>Smart hydration schedule &amp; daily alerts</p>
+</a>
+
+</div>
+</div>
+
+{% endblock %}

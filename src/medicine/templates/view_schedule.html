@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Medicine Schedule</h2>
+
+<table>
+
+<tr>
+<th>ID</th>
+<th>Section</th>
+<th>Time</th>
+<th>Dosage</th>
+<th>Food</th>
+<th>Water</th>
+<th>Action</th>
+</tr>
+
+{% for row in data %}
+
+<tr>
+<td>{{row[0]}}</td>
+<td>{{row[1]}}</td>
+<td>{{row[2]}}</td>
+<td>{{row[3]}}</td>
+<td>{{row[4]}}</td>
+<td>{{row[5]}}</td>
+
+<!-- new update - edit and delete - 7.3.25 -->
+
+
+<td>
+
+<a class="edit-btn" href="/edit_schedule/{{row[0]}}">
+✏️ Edit
+</a>
+
+<a class="delete-btn" href="/delete_schedule/{{row[0]}}">
+🗑 Delete
+</a>
+
+</td>
+
+</tr>
+
+{% endfor %}
+
+</table>
+
+{% endblock %}

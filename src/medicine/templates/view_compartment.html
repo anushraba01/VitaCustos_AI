@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Medicine List</h2>
+
+<table border="1">
+
+<tr>
+<th>Section</th>
+<th>Medicine</th>
+<th>Type</th>
+<th>Servo Angle</th>
+<th>Expiry</th>
+<th>Quantity</th>
+<th>Action</th>
+</tr>
+
+{% for row in data %}
+
+<tr>
+<td>{{row[0]}}</td>
+<td>{{row[1]}}</td>
+<td>{{row[2]}}</td>
+<td>{{row[3]}}</td>
+<td>{{row[4]}}</td>
+<td>{{row[5]}}</td>
+
+<!-- new update - edit and delete - 7.3.25 -->
+
+<td>
+
+<a class="edit-btn" href="/edit_compartment/{{row[0]}}">
+✏️ Edit
+</a>
+
+<a class="delete-btn" href="/delete_compartment/{{row[0]}}">
+🗑 Delete
+</a>
+
+</td>
+
+</tr>
+
+{% endfor %}
+
+</table>
+
+{% endblock %}

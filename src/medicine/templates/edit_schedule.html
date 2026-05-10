@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Edit Schedule</h2>
+
+<div class="form-box">
+
+<form action="/update_schedule" method="POST">
+
+<input type="hidden" name="schedule_id" value="{{data[0]}}">
+
+<label>Section</label>
+<input type="text" name="section_id" value="{{data[1]}}">
+
+<label>Time</label>
+<input type="time" name="time" value="{{data[2]}}">
+
+<label>Dosage</label>
+<input type="number" name="dosage" value="{{data[3]}}">
+
+<label>Before / After Food</label>
+<select name="before_after_food">
+
+<option value="Before" {% if data[4]=="Before" %}selected{% endif %}>Before</option>
+
+<option value="After" {% if data[4]=="After" %}selected{% endif %}>After</option>
+
+</select>
+
+<label>Water (ml)</label>
+<input type="number" name="water_ml" value="{{data[5]}}">
+
+<button type="submit">Update Schedule</button>
+
+</form>
+
+</div>
+
+{% endblock %}

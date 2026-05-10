@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2>Add Medicine</h2>
+
+<div class="form-box">
+
+<form action="/insert_compartment" method="POST">
+
+<label>Section ID</label>
+<select name="section_id" id="section" onchange="setServoAngle()" required>
+<option value="">Select Section</option>
+<option value="S1" disabled>S1 - Water Reserve</option>
+<option value="S2">S2 - Medicine Chamber</option>
+<option value="S3">S3 - Medicine Chamber</option>
+</select>
+
+
+<label>Medicine Name</label>
+<input type="text" name="medicine_name" required>
+
+
+<label>Medicine Type</label>
+<select name="medicine_type">
+<option>Tablet</option>
+<option>Capsule</option>
+<option>Syrup</option>
+</select>
+
+
+<label>Servo Angle</label>
+<input type="number" name="servo_angle" id="servo_angle" readonly>
+
+
+<label>Expiry Date</label>
+<input type="date" name="expiry_date">
+
+
+<label>Quantity</label>
+<input type="number" name="current_quantity">
+
+
+<button type="submit">Add Medicine</button>
+
+</form>
+
+</div>
+
+
+<script>
+
+function setServoAngle(){
+
+let section = document.getElementById("section").value;
+let angleField = document.getElementById("servo_angle");
+
+let angles = {
+"S1":90,
+"S2":180,
+"S3":270,
+
+};
+
+angleField.value = angles[section] || "";
+
+}
+
+</script>
+
+{% endblock %}
