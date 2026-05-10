@@ -1,69 +1,65 @@
+#!/usr/bin/env python3
 """
-navigation.py — Child-Following Robot Navigation System
-========================================================
-Hardware:
-  • Raspberry Pi 4
-  • Camera (Pi Camera v2 or USB webcam)
-  • HC-SR04 Ultrasonic Distance Sensor
-  • 2× L298N Motor Driver (controls 4 DC motors)
-  • 4 DC Motors (differential drive: left-pair + right-pair)
+navigation.py — Child-Following Robot  (Forward-Only Follow Fix)
+================================================================
+Target: 10–20 FPS on Raspberry Pi 4
 
-Algorithm Stack:
-  • YOLOv8-nano  — ultra-lightweight real-time child/person detection
-  • DeepSORT      — multi-target tracking (lock onto a single child)
-  • Dual PID      — angular (steering) + linear (speed) control loops
-  • Safety layer  — ultrasonic hard-stop at ≤60 cm
+CORE LOGIC:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  DISTANCE = bbox height / frame height  (h_ratio)          │
+  │                                                             │
+  │  h_ratio < TARGET_H - HTOL  → person is FAR  → FORWARD    │
+  │  h_ratio > TARGET_H + HTOL  → person is NEAR → STOP       │
+  │  within ±HTOL               → distance OK    → steer only  │
+  │                                                             │
+  │  TARGET_H = 0.45  (calibrate: stand at target distance,    │
+  │             read H=x.xx on screen, set that value)         │
+  │                                                             │
+  │  ⚠ Robot NEVER goes backward — sonar is the only stop.    │
+  └─────────────────────────────────────────────────────────────┘
+
+  STEERING (X axis):
+  x_dev = cx_norm - 0.5   (-0.5=far left … +0.5=far right)
+  x_dev > +TOL  → turn right
+  x_dev < -TOL  → turn left
+
+GPIO Pins:
+  Left  motors : IN1=17  IN2=18  ENA=22
+  Right motors : IN3=23  IN4=24  ENB=25
+  Ultrasonic   : TRIG=5   ECHO=6
+
+HOW TO CALIBRATE TARGET_H (do this first!):
+  1. Run the script, stand at the distance you want the robot to follow from.
+  2. Look at the HUD or terminal — note the "H=x.xx" value shown.
+  3. Stop the script, set TARGET_H to that value.
+  4. Restart — robot will now maintain that exact distance.
 
 Dependencies:
-  pip install ultralytics opencv-python-headless numpy RPi.GPIO
-  pip install deep-sort-realtime
-
-Wiring Reference:
-  L298N #1 (LEFT motors)          L298N #2 (RIGHT motors)
-  ─────────────────────────       ──────────────────────────
-  IN1  → GPIO 17                  IN3  → GPIO 22
-  IN2  → GPIO 27                  IN4  → GPIO 23
-  ENA  → GPIO 18 (PWM)            ENB  → GPIO 25 (PWM)
-
-  HC-SR04
-  ───────
-  TRIG → GPIO 24
-  ECHO → GPIO 8   (use 1kΩ + 2kΩ voltage divider on ECHO line!)
+  pip install ultralytics opencv-python numpy RPi.GPIO
 """
 
 import time
 import threading
 import logging
-from dataclasses import dataclass, field
+import math
 from collections import deque
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 
-# ── Conditional imports (graceful fallback for dev/test on non-Pi) ──────────
 try:
     import RPi.GPIO as GPIO
     ON_PI = True
 except ImportError:
     ON_PI = False
-    print("[WARN] RPi.GPIO not found — running in SIMULATION mode")
+    print("[WARN] RPi.GPIO not found — SIMULATION mode")
 
 try:
     from ultralytics import YOLO
-    YOLO_AVAILABLE = True
 except ImportError:
-    YOLO_AVAILABLE = False
-    print("[WARN] ultralytics not installed — install with: pip install ultralytics")
+    raise SystemExit("Missing: pip install ultralytics")
 
-try:
-    from deep_sort_realtime.deepsort_tracker import DeepSort
-    DEEPSORT_AVAILABLE = True
-except ImportError:
-    DEEPSORT_AVAILABLE = False
-    print("[WARN] deep-sort-realtime not installed. Falling back to centroid tracking.")
-
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -73,656 +69,765 @@ log = logging.getLogger("ChildBot")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. CONFIGURATION
+# CONFIGURATION  — tune TARGET_H first, everything else second
 # ═══════════════════════════════════════════════════════════════════════════
-@dataclass
-class Config:
-    # ── GPIO Pins ────────────────────────────────────────────────────────
-    PIN_IN1:  int = 17    # Left  forward
-    PIN_IN2:  int = 27    # Left  backward
-    PIN_ENA:  int = 18    # Left  PWM speed
+class CFG:
+    # ── GPIO ──────────────────────────────────────────────────────────────
+    IN1 = 17;  IN2 = 18;  ENA = 22
+    IN3 = 23;  IN4 = 24;  ENB = 25
+    TRIG = 5;  ECHO = 6
 
-    PIN_IN3:  int = 22    # Right forward
-    PIN_IN4:  int = 23    # Right backward
-    PIN_ENB:  int = 25    # Right PWM speed
+    # ── Camera ────────────────────────────────────────────────────────────
+    CAM_INDEX = 0
+    CAM_W = 640;  CAM_H = 480;  CAM_FPS = 30
 
-    PIN_TRIG: int = 24    # Ultrasonic trigger
-    PIN_ECHO: int = 8     # Ultrasonic echo
+    # ── YOLO ──────────────────────────────────────────────────────────────
+    MODEL      = "yolov8n.pt"
+    INFER_SIZE = 160
+    CONF       = 0.45
+    IOU        = 0.45
+    SKIP       = 2          # run YOLO every (SKIP+1) frames → 1-in-3
 
-    # ── Camera ───────────────────────────────────────────────────────────
-    CAMERA_INDEX:   int   = 0
-    FRAME_WIDTH:    int   = 640
-    FRAME_HEIGHT:   int   = 480
-    TARGET_FPS:     int   = 30
+    # ── Steering dead-zone ────────────────────────────────────────────────
+    TOLERANCE = 0.12        # ±12% of frame width — increase to reduce jitter
 
-    # ── Detection ────────────────────────────────────────────────────────
-    YOLO_MODEL:         str   = "yolov8n.pt"   # nano = fastest on Pi
-    YOLO_CONF:          float = 0.50
-    YOLO_IOU:           float = 0.45
-    PERSON_CLASS_ID:    int   = 0              # COCO class 0 = person
-    # Prefer detections whose box height suggests a CHILD (shorter stature)
-    # Ratio of box_height / frame_height: adult ~0.6+, child ~0.3-0.55
-    CHILD_HEIGHT_MAX_RATIO: float = 0.70
-    CHILD_HEIGHT_MIN_RATIO: float = 0.10
+    # ── Distance control via BBOX HEIGHT ─────────────────────────────────
+    #
+    #  ★ CALIBRATE THIS FIRST — see header instructions above ★
+    #  Typical values:
+    #    ~1.0 m away → h_ratio ≈ 0.45–0.55
+    #    ~1.5 m away → h_ratio ≈ 0.30–0.40
+    #    ~2.0 m away → h_ratio ≈ 0.20–0.28
+    #
+    #  If robot does NOT move forward → your h_ratio is ABOVE this value
+    #  → raise TARGET_H until the robot starts moving.
+    #
+    TARGET_H = 0.45         # ideal follow distance (bbox height fraction)
+    HTOL     = 0.06         # ±6% dead-zone — increase if robot oscillates
 
-    # ── Tracking ─────────────────────────────────────────────────────────
-    MAX_AGE:        int   = 30    # frames before track is dropped
-    N_INIT:         int   = 3     # confirmations needed to establish track
-    MAX_COSINE_DIST:float = 0.4
+    # ── Lost track ────────────────────────────────────────────────────────
+    LOST_LIMIT = 25
 
-    # ── Safety ───────────────────────────────────────────────────────────
-    STOP_DISTANCE_CM:   float = 60.0   # hard stop (ultrasonic)
-    SLOW_DISTANCE_CM:   float = 90.0   # start slowing down
+    # ── Safety (ultrasonic) — ONLY thing that triggers stop ───────────────
+    STOP_CM = 50.0          # hard stop distance
+    SLOW_CM = 90.0          # begin ramping down speed before stop
 
-    # ── PID — Angular (steering) ─────────────────────────────────────────
-    ANG_KP: float = 0.55
-    ANG_KI: float = 0.003
-    ANG_KD: float = 0.12
-    ANG_DEADBAND: float = 0.04  # fraction of frame width (±4% = no turn)
+    # ── Motor speeds (PWM duty cycle %) ───────────────────────────────────
+    PWM_HZ    = 1000
+    FWD_SPD   = 65.0        # forward cruise speed %
+    TURN_SPD  = 55.0        # speed when turning in-place
+    SLOW_SPD  = 38.0        # speed when close to target distance
+    MIN_SPD   = 25.0        # below this → 0 (prevent stall)
 
-    # ── PID — Linear (forward speed) ─────────────────────────────────────
-    LIN_KP: float = 1.10
-    LIN_KI: float = 0.005
-    LIN_KD: float = 0.20
-    # Target: keep child box at ~35% of frame height (comfortable follow distance)
-    LIN_TARGET_RATIO: float = 0.35
+    # ── Search ────────────────────────────────────────────────────────────
+    SEARCH_SPD = 35.0       # spin speed when person lost
 
-    # ── Motor PWM ────────────────────────────────────────────────────────
-    PWM_FREQ:       int   = 1000   # Hz
-    BASE_SPEED:     float = 55.0   # % duty cycle at neutral
-    MAX_SPEED:      float = 85.0   # % duty cycle cap
-    MIN_SPEED:      float = 30.0   # % below this → stop (dead-zone)
-    TURN_BOOST:     float = 25.0   # extra % added to faster side when turning
-
-    # ── Misc ─────────────────────────────────────────────────────────────
-    LOOP_DELAY_S:   float = 0.033  # ~30 Hz main loop
-    ULTRASONIC_INTERVAL_S: float = 0.10  # read distance every 100 ms
-
-
-CFG = Config()
+    # ── Display ───────────────────────────────────────────────────────────
+    SHOW = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2. PID CONTROLLER
+# THREADED CAMERA
 # ═══════════════════════════════════════════════════════════════════════════
-class PID:
+class ThreadedCamera:
+    def __init__(self):
+        self._cap = cv2.VideoCapture(CFG.CAM_INDEX)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.CAM_W)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.CAM_H)
+        self._cap.set(cv2.CAP_PROP_FPS,          CFG.CAM_FPS)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        if not self._cap.isOpened():
+            raise RuntimeError("Cannot open camera!")
+        self._frame:  Optional[np.ndarray] = None
+        self._cam_ms: float = 0.0
+        self._lock  = threading.Lock()
+        self._stop  = False
+        threading.Thread(target=self._loop, daemon=True).start()
+        time.sleep(0.30)
+        log.info("Camera ready.")
+
+    def _loop(self):
+        while not self._stop:
+            t0 = time.monotonic()
+            ret, frame = self._cap.read()
+            if ret:
+                with self._lock:
+                    self._frame  = frame
+                    self._cam_ms = (time.monotonic() - t0) * 1000
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray], float]:
+        with self._lock:
+            if self._frame is None:
+                return False, None, 0.0
+            return True, self._frame.copy(), self._cam_ms
+
+    def release(self):
+        self._stop = True
+        time.sleep(0.05)
+        self._cap.release()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CENTROID TRACKER  (lightweight, no DeepSORT)
+# ═══════════════════════════════════════════════════════════════════════════
+class CentroidTracker:
+    def __init__(self):
+        self.bbox: Optional[Tuple] = None   # (x1,y1,x2,y2) in 0-1
+        self._vel  = np.zeros(4)
+        self.lost  = 0
+
+    def update(self, bbox_norm: Optional[Tuple]):
+        if bbox_norm is None:
+            self.lost += 1
+            if self.lost > CFG.LOST_LIMIT:
+                self.bbox = None
+                self._vel = np.zeros(4)
+            else:
+                self._step()
+            return
+        new = np.array(bbox_norm, dtype=float)
+        if self.bbox is not None:
+            self._vel = new - np.array(self.bbox)
+        self.bbox = tuple(new.tolist())
+        self.lost = 0
+
+    def extrapolate(self):
+        self._step()
+
+    def _step(self):
+        if self.bbox is None:
+            return
+        b = np.clip(np.array(self.bbox) + self._vel * 0.4, 0.0, 1.0)
+        if b[0] < b[2] and b[1] < b[3]:
+            self.bbox = tuple(b.tolist())
+        self._vel *= 0.85
+
+    @property
+    def cx_norm(self) -> Optional[float]:
+        return None if self.bbox is None else (self.bbox[0] + self.bbox[2]) / 2
+
+    @property
+    def h_ratio(self) -> Optional[float]:
+        return None if self.bbox is None else (self.bbox[3] - self.bbox[1])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTORS  — forward-only policy (no backward ever)
+# ═══════════════════════════════════════════════════════════════════════════
+class Motors:
     """
-    Discrete PID with anti-windup, derivative-on-measurement,
-    and output clamping.
-    """
-    def __init__(self, kp: float, ki: float, kd: float,
-                 out_min: float = -1.0, out_max: float = 1.0,
-                 name: str = "PID"):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.out_min, self.out_max = out_min, out_max
-        self.name = name
-        self._integral   = 0.0
-        self._prev_meas  = None
-        self._prev_time  = None
+    Forward-only motor control.
+    The robot NEVER drives backward — sonar handles all obstacle stopping.
 
-    def reset(self):
-        self._integral   = 0.0
-        self._prev_meas  = None
-        self._prev_time  = None
-
-    def compute(self, setpoint: float, measurement: float) -> float:
-        now = time.monotonic()
-        error = setpoint - measurement
-
-        if self._prev_time is None:
-            dt = CFG.LOOP_DELAY_S
-        else:
-            dt = now - self._prev_time
-            dt = max(dt, 1e-4)
-
-        # Proportional
-        p = self.kp * error
-
-        # Integral with anti-windup clamp
-        self._integral += error * dt
-        i_raw = self.ki * self._integral
-        i_clamped = np.clip(i_raw, self.out_min, self.out_max)
-        # Back-calculate anti-windup
-        if i_raw != 0:
-            self._integral *= (i_clamped / i_raw) if abs(i_raw) > 1e-9 else 1.0
-
-        # Derivative on measurement (avoids derivative kick on setpoint change)
-        if self._prev_meas is not None:
-            d = -self.kd * (measurement - self._prev_meas) / dt
-        else:
-            d = 0.0
-
-        output = np.clip(p + i_clamped + d, self.out_min, self.out_max)
-
-        self._prev_time = now
-        self._prev_meas = measurement
-        return float(output)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. MOTOR CONTROLLER
-# ═══════════════════════════════════════════════════════════════════════════
-class MotorController:
-    """
-    Differential-drive wrapper for 2× L298N (4 motors).
-    Left pair  = IN1/IN2/ENA
-    Right pair = IN3/IN4/ENB
+    If the robot physically moves the WRONG direction on 'forward()':
+      → Swap IN1↔IN2 for left  (or reverse left wheel wire physically)
+      → Swap IN3↔IN4 for right (or reverse right wheel wire physically)
     """
 
     def __init__(self):
-        self._left_pwm  = None
-        self._right_pwm = None
+        self._lp = self._rp = None
         if ON_PI:
-            self._setup_gpio()
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            for pin in [CFG.IN1, CFG.IN2, CFG.ENA,
+                        CFG.IN3, CFG.IN4, CFG.ENB]:
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            self._lp = GPIO.PWM(CFG.ENA, CFG.PWM_HZ)
+            self._rp = GPIO.PWM(CFG.ENB, CFG.PWM_HZ)
+            self._lp.start(0)
+            self._rp.start(0)
+            log.info("Motors GPIO ready (BCM).")
 
-    def _setup_gpio(self):
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        pins = [CFG.PIN_IN1, CFG.PIN_IN2, CFG.PIN_ENA,
-                CFG.PIN_IN3, CFG.PIN_IN4, CFG.PIN_ENB]
-        GPIO.setup(pins, GPIO.OUT, initial=GPIO.LOW)
-        self._left_pwm  = GPIO.PWM(CFG.PIN_ENA, CFG.PWM_FREQ)
-        self._right_pwm = GPIO.PWM(CFG.PIN_ENB, CFG.PWM_FREQ)
-        self._left_pwm.start(0)
-        self._right_pwm.start(0)
-        log.info("GPIO motors initialised.")
-
-    def _set_left(self, speed: float):
-        """speed: -100 … +100  (+ve = forward)"""
-        if not ON_PI:
-            return
-        speed = float(np.clip(speed, -100, 100))
-        if speed >= 0:
-            GPIO.output(CFG.PIN_IN1, GPIO.HIGH)
-            GPIO.output(CFG.PIN_IN2, GPIO.LOW)
-        else:
-            GPIO.output(CFG.PIN_IN1, GPIO.LOW)
-            GPIO.output(CFG.PIN_IN2, GPIO.HIGH)
-        self._left_pwm.ChangeDutyCycle(abs(speed))
-
-    def _set_right(self, speed: float):
-        """speed: -100 … +100  (+ve = forward)"""
-        if not ON_PI:
-            return
-        speed = float(np.clip(speed, -100, 100))
-        if speed >= 0:
-            GPIO.output(CFG.PIN_IN3, GPIO.HIGH)
-            GPIO.output(CFG.PIN_IN4, GPIO.LOW)
-        else:
-            GPIO.output(CFG.PIN_IN3, GPIO.LOW)
-            GPIO.output(CFG.PIN_IN4, GPIO.HIGH)
-        self._right_pwm.ChangeDutyCycle(abs(speed))
-
-    def drive(self, linear: float, angular: float):
+    def _drive_left(self, spd: float):
         """
-        linear  : -1.0 (back) … +1.0 (forward)
-        angular : -1.0 (turn left) … +1.0 (turn right)
+        spd: 0–100 (always FORWARD for left wheel).
+        Internally maps to IN1=HIGH, IN2=LOW.
+        If robot goes backward → change HIGH/LOW here.
         """
-        base  = linear  * CFG.BASE_SPEED
-        turn  = angular * CFG.TURN_BOOST
+        spd = float(np.clip(abs(spd), 0, 100))
+        if ON_PI:
+            GPIO.output(CFG.IN1, GPIO.HIGH)   # ← FORWARD direction for left
+            GPIO.output(CFG.IN2, GPIO.LOW)
+            self._lp.ChangeDutyCycle(spd)
 
-        left_speed  = np.clip(base - turn, -CFG.MAX_SPEED, CFG.MAX_SPEED)
-        right_speed = np.clip(base + turn, -CFG.MAX_SPEED, CFG.MAX_SPEED)
+    def _drive_right(self, spd: float):
+        """
+        spd: 0–100 (always FORWARD for right wheel).
+        Internally maps to IN3=HIGH, IN4=LOW.
+        If robot goes backward → change HIGH/LOW here.
+        """
+        spd = float(np.clip(abs(spd), 0, 100))
+        if ON_PI:
+            GPIO.output(CFG.IN3, GPIO.HIGH)   # ← FORWARD direction for right
+            GPIO.output(CFG.IN4, GPIO.LOW)
+            self._rp.ChangeDutyCycle(spd)
 
-        # Dead-zone: ignore very small commands
-        if abs(left_speed)  < CFG.MIN_SPEED: left_speed  = 0
-        if abs(right_speed) < CFG.MIN_SPEED: right_speed = 0
+    def _spin_left_wheel(self, spd: float):
+        """Spin left wheel BACKWARD (for in-place search spin)."""
+        spd = float(np.clip(abs(spd), 0, 100))
+        if ON_PI:
+            GPIO.output(CFG.IN1, GPIO.LOW)
+            GPIO.output(CFG.IN2, GPIO.HIGH)
+            self._lp.ChangeDutyCycle(spd)
 
-        self._set_left(left_speed)
-        self._set_right(right_speed)
+    def _spin_right_wheel(self, spd: float):
+        """Spin right wheel BACKWARD (for in-place search spin)."""
+        spd = float(np.clip(abs(spd), 0, 100))
+        if ON_PI:
+            GPIO.output(CFG.IN3, GPIO.LOW)
+            GPIO.output(CFG.IN4, GPIO.HIGH)
+            self._rp.ChangeDutyCycle(spd)
 
+    def forward(self, spd: float = CFG.FWD_SPD):
+        """Drive straight forward."""
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        self._drive_left(spd)
+        self._drive_right(spd)
         if not ON_PI:
-            log.debug(f"[SIM] L={left_speed:+.1f}  R={right_speed:+.1f}")
+            log.debug(f"[SIM] FORWARD  L={spd:.0f}%  R={spd:.0f}%")
+
+    def forward_steer_right(self, spd: float):
+        """
+        Move forward while leaning RIGHT (person is to the right).
+        Left wheel full speed, right wheel reduced → curves right.
+        """
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        inner = max(spd * 0.30, CFG.MIN_SPD)
+        self._drive_left(spd)
+        self._drive_right(inner)
+        if not ON_PI:
+            log.debug(f"[SIM] FORWARD+R  L={spd:.0f}%  R={inner:.0f}%")
+
+    def forward_steer_left(self, spd: float):
+        """
+        Move forward while leaning LEFT (person is to the left).
+        Right wheel full speed, left wheel reduced → curves left.
+        """
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        inner = max(spd * 0.30, CFG.MIN_SPD)
+        self._drive_left(inner)
+        self._drive_right(spd)
+        if not ON_PI:
+            log.debug(f"[SIM] FORWARD+L  L={inner:.0f}%  R={spd:.0f}%")
+
+    def turn_right(self, spd: float = CFG.TURN_SPD):
+        """Turn right in place: left forward, right slow/stop."""
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        self._drive_left(spd)
+        self._drive_right(spd * 0.10)
+        if not ON_PI:
+            log.debug(f"[SIM] TURN RIGHT  L={spd:.0f}%  R={spd*0.10:.0f}%")
+
+    def turn_left(self, spd: float = CFG.TURN_SPD):
+        """Turn left in place: right forward, left slow/stop."""
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        self._drive_left(spd * 0.10)
+        self._drive_right(spd)
+        if not ON_PI:
+            log.debug(f"[SIM] TURN LEFT  L={spd*0.10:.0f}%  R={spd:.0f}%")
+
+    def spin_search_right(self, spd: float = CFG.SEARCH_SPD):
+        """In-place spin RIGHT to search (left fwd, right back)."""
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        self._drive_left(spd)
+        self._spin_right_wheel(spd)
+        if not ON_PI:
+            log.debug(f"[SIM] SPIN RIGHT  L=+{spd:.0f}%  R=-{spd:.0f}%")
+
+    def spin_search_left(self, spd: float = CFG.SEARCH_SPD):
+        """In-place spin LEFT to search (right fwd, left back)."""
+        spd = float(np.clip(spd, CFG.MIN_SPD, 100))
+        self._spin_left_wheel(spd)
+        self._drive_right(spd)
+        if not ON_PI:
+            log.debug(f"[SIM] SPIN LEFT  L=-{spd:.0f}%  R=+{spd:.0f}%")
 
     def stop(self):
-        self._set_left(0)
-        self._set_right(0)
+        if ON_PI:
+            for pin in [CFG.IN1, CFG.IN2, CFG.IN3, CFG.IN4]:
+                GPIO.output(pin, GPIO.LOW)
+            self._lp.ChangeDutyCycle(0)
+            self._rp.ChangeDutyCycle(0)
         if not ON_PI:
             log.debug("[SIM] STOP")
 
     def cleanup(self):
         self.stop()
         if ON_PI:
-            if self._left_pwm:  self._left_pwm.stop()
-            if self._right_pwm: self._right_pwm.stop()
+            if self._lp: self._lp.stop()
+            if self._rp: self._rp.stop()
             GPIO.cleanup()
             log.info("GPIO cleaned up.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. ULTRASONIC SENSOR  (runs in background thread)
+# ULTRASONIC SENSOR
 # ═══════════════════════════════════════════════════════════════════════════
-class UltrasonicSensor:
-    """
-    Non-blocking HC-SR04 reader.
-    Median-filtered over a rolling window to reject noise spikes.
-    """
-    _WINDOW = 5
-    _TIMEOUT = 0.04   # 40 ms = ~6.8 m max range
+class Sonar:
+    _WIN = 5
 
     def __init__(self):
-        self._distance_cm = 999.0
+        self._dist = 999.0
         self._lock = threading.Lock()
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
+        self._buf  = deque(maxlen=self._WIN)
+        self._run  = False
         if ON_PI:
-            GPIO.setup(CFG.PIN_TRIG, GPIO.OUT)
-            GPIO.setup(CFG.PIN_ECHO, GPIO.IN)
-            GPIO.output(CFG.PIN_TRIG, GPIO.LOW)
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(CFG.TRIG, GPIO.OUT)
+            GPIO.setup(CFG.ECHO, GPIO.IN)
+            GPIO.output(CFG.TRIG, GPIO.LOW)
             time.sleep(0.05)
 
-        self._history: deque = deque(maxlen=self._WINDOW)
-
-    def _measure_once(self) -> float:
+    def _ping(self) -> float:
         if not ON_PI:
             return 999.0
-        GPIO.output(CFG.PIN_TRIG, GPIO.HIGH)
-        time.sleep(0.00001)   # 10 µs pulse
-        GPIO.output(CFG.PIN_TRIG, GPIO.LOW)
-
+        GPIO.output(CFG.TRIG, GPIO.HIGH)
+        time.sleep(1e-5)
+        GPIO.output(CFG.TRIG, GPIO.LOW)
         t0 = time.monotonic()
-        while GPIO.input(CFG.PIN_ECHO) == 0:
-            if time.monotonic() - t0 > self._TIMEOUT:
-                return 999.0
-        pulse_start = time.monotonic()
+        while GPIO.input(CFG.ECHO) == 0:
+            if time.monotonic() - t0 > 0.04: return 999.0
+        s = time.monotonic()
+        while GPIO.input(CFG.ECHO) == 1:
+            if time.monotonic() - s  > 0.04: return 999.0
+        return (time.monotonic() - s) * 17150
 
-        while GPIO.input(CFG.PIN_ECHO) == 1:
-            if time.monotonic() - pulse_start > self._TIMEOUT:
-                return 999.0
-        pulse_end = time.monotonic()
-
-        distance = (pulse_end - pulse_start) * 17150  # cm (speed of sound / 2)
-        return round(distance, 1)
-
-    def _run(self):
-        while self._running:
-            d = self._measure_once()
-            if 2 < d < 400:           # sanity check (2 cm – 4 m)
-                self._history.append(d)
-            if self._history:
+    def _loop(self):
+        while self._run:
+            d = self._ping()
+            if 2 < d < 400:
+                self._buf.append(d)
                 with self._lock:
-                    self._distance_cm = float(np.median(self._history))
-            time.sleep(CFG.ULTRASONIC_INTERVAL_S)
+                    self._dist = float(np.median(self._buf))
+            time.sleep(0.10)
 
     def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._run = True
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
-        self._running = False
+        self._run = False
 
     @property
-    def distance_cm(self) -> float:
+    def cm(self) -> float:
         with self._lock:
-            return self._distance_cm
+            return self._dist
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. CHILD DETECTOR  (YOLOv8-nano + optional DeepSORT)
+# HUD RENDERER
 # ═══════════════════════════════════════════════════════════════════════════
-@dataclass
-class Detection:
-    x1: float; y1: float; x2: float; y2: float
-    confidence: float
-    track_id: int = -1
+class HUD:
+    C_BLUE   = (200,  80,  20)
+    C_GREEN  = ( 50, 210,  50)
+    C_YELLOW = (  0, 210, 210)
+    C_RED    = (  0,   0, 210)
+    C_WHITE  = (235, 235, 235)
+    C_BLACK  = (  0,   0,   0)
+    C_ORANGE = ( 20, 140, 255)
+    C_GREY   = (160, 160, 160)
+    C_CYAN   = (210, 210,   0)
 
-    @property
-    def cx(self) -> float:   return (self.x1 + self.x2) / 2
-    @property
-    def cy(self) -> float:   return (self.y1 + self.y2) / 2
-    @property
-    def width(self)  -> float: return self.x2 - self.x1
-    @property
-    def height(self) -> float: return self.y2 - self.y1
-    @property
-    def area(self)   -> float: return self.width * self.height
+    STATUS_COLOR = {
+        "NO OBJECT": ( 50,  50, 180),
+        "TRACKING":  ( 20, 190, 255),
+        "AT TARGET": ( 40, 200,  40),
+    }
+    DIR_COLOR = {
+        "FORWARD":    ( 40, 200,  40),
+        "FORWARD+L":  ( 20, 200, 100),
+        "FORWARD+R":  ( 20, 200, 100),
+        "TURN LEFT":  (  0, 190, 255),
+        "TURN RIGHT": (  0, 190, 255),
+        "AT TARGET":  ( 40, 200,  40),
+        "SEARCHING":  (200, 200,   0),
+        "SONAR STOP": (  0,   0, 255),
+        "TOO CLOSE":  (  0, 100, 255),
+    }
 
+    BAR  = 42
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-class ChildDetector:
-    """
-    YOLOv8-nano inference + DeepSORT tracking.
-    Scores detections to prefer child-sized persons.
-    Locks onto one track ID and only reports that child.
-    """
+    def render(self,
+               frame:     np.ndarray,
+               bbox:      Optional[Tuple],
+               x_dev:     float,
+               h_ratio:   float,
+               direction: str,
+               speed_pct: float,
+               fps:       float,
+               cam_ms:    float,
+               inf_ms:    float,
+               status:    str,
+               sonar_cm:  float) -> np.ndarray:
 
-    def __init__(self):
-        if not YOLO_AVAILABLE:
-            raise RuntimeError("ultralytics is required. Run: pip install ultralytics")
+        H, W = frame.shape[:2]
+        fcx, fcy = W // 2, H // 2
+        tx = int(CFG.TOLERANCE * W)
+        ty = int(CFG.TOLERANCE * H)
+        out = frame.copy()
 
-        log.info(f"Loading YOLO model: {CFG.YOLO_MODEL} …")
-        self.model = YOLO(CFG.YOLO_MODEL)
-        # Warm-up: first inference is always slow
-        dummy = np.zeros((CFG.FRAME_HEIGHT, CFG.FRAME_WIDTH, 3), dtype=np.uint8)
-        self.model(dummy, verbose=False)
-        log.info("YOLO model ready.")
+        # Crosshair
+        cv2.line(out, (fcx, 0), (fcx, H), self.C_BLUE, 1, cv2.LINE_AA)
+        cv2.line(out, (0, fcy), (W, fcy), self.C_BLUE, 1, cv2.LINE_AA)
 
-        self.tracker = None
-        if DEEPSORT_AVAILABLE:
-            self.tracker = DeepSort(
-                max_age=CFG.MAX_AGE,
-                n_init=CFG.N_INIT,
-                max_cosine_distance=CFG.MAX_COSINE_DIST,
-                nn_budget=100,
-                embedder="mobilenet",        # lightweight re-ID backbone
-                embedder_gpu=False,
-            )
-            log.info("DeepSORT tracker ready.")
-        else:
-            log.warning("DeepSORT unavailable — using nearest-centroid tracker.")
+        # Tolerance box
+        cv2.rectangle(out, (fcx-tx, fcy-ty), (fcx+tx, fcy+ty),
+                      self.C_GREEN, 2)
 
-        self._locked_id: int   = -1    # track ID we are following
-        self._lost_frames: int = 0
-        self._LOST_THRESHOLD = 20
+        # Target height line — where TARGET_H maps on screen
+        # A person filling TARGET_H of the frame has bbox bottom at roughly:
+        tgt_y = int(H * (1.0 - CFG.TARGET_H) / 2)  # approximate visual guide
+        cv2.line(out, (0, tgt_y), (W, tgt_y), self.C_CYAN, 1, cv2.LINE_AA)
+        cv2.line(out, (0, H - tgt_y), (W, H - tgt_y), self.C_CYAN, 1, cv2.LINE_AA)
+        cv2.putText(out, f"TARGET H={CFG.TARGET_H:.2f}", (4, tgt_y - 4),
+                    self.FONT, 0.38, self.C_CYAN, 1)
 
-    def _score_detection(self, det: Detection, frame_h: int) -> float:
-        """
-        Heuristic score: prefer mid-frame, child-height-ratio detections.
-        Higher = better candidate to follow.
-        """
-        h_ratio = det.height / frame_h
-        in_range = CFG.CHILD_HEIGHT_MIN_RATIO < h_ratio < CFG.CHILD_HEIGHT_MAX_RATIO
-        return det.confidence * (1.2 if in_range else 0.5)
+        # Bounding box + centroid
+        if bbox is not None:
+            x1 = int(bbox[0]*W); y1 = int(bbox[1]*H)
+            x2 = int(bbox[2]*W); y2 = int(bbox[3]*H)
+            cv2.rectangle(out, (x1,y1), (x2,y2), self.C_YELLOW, 2)
+            ocx = (x1+x2)//2
+            ocy = (y1+y2)//2
+            cv2.circle(out, (ocx, ocy), 6, self.C_RED, -1)
+            cv2.line(out, (ocx, ocy), (fcx, fcy), self.C_YELLOW, 1, cv2.LINE_AA)
+            # Show current h_ratio on bbox — use this for TARGET_H calibration
+            cv2.putText(out, f"H={h_ratio:.2f}", (x1, y1-6),
+                        self.FONT, 0.50, self.C_YELLOW, 2)
 
-    def detect(self, frame: np.ndarray) -> Optional[Detection]:
-        fh, fw = frame.shape[:2]
+        # TOP BAR
+        cv2.rectangle(out, (0, 0), (W, self.BAR), self.C_BLACK, -1)
+        ty_t = self.BAR - 10
+        cv2.putText(out, f"FPS:{fps:.1f}", (4, ty_t),
+                    self.FONT, 0.65, self.C_WHITE, 2)
+        cv2.putText(out, f"Cam:{cam_ms:.0f}ms  Inf:{inf_ms:.0f}ms",
+                    (100, ty_t), self.FONT, 0.50, self.C_GREY, 1)
+        s_col = self.STATUS_COLOR.get(status, self.C_WHITE)
+        (sw, _), _ = cv2.getTextSize(status, self.FONT, 0.65, 2)
+        cv2.putText(out, status, (W-sw-6, ty_t),
+                    self.FONT, 0.65, s_col, 2)
 
-        # ── YOLO inference ───────────────────────────────────────────────
-        results = self.model(
-            frame,
-            classes=[CFG.PERSON_CLASS_ID],
-            conf=CFG.YOLO_CONF,
-            iou=CFG.YOLO_IOU,
-            imgsz=320,        # downsample internally → faster on Pi
-            verbose=False,
-        )
+        # BOTTOM BAR
+        by0 = H - self.BAR
+        cv2.rectangle(out, (0, by0), (W, H), self.C_BLACK, -1)
+        by_t = H - 10
 
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            self._lost_frames += 1
-            if self._lost_frames > self._LOST_THRESHOLD:
-                self._locked_id = -1
-            return None
+        xc = self.C_ORANGE if abs(x_dev) > CFG.TOLERANCE else self.C_GREEN
+        cv2.putText(out, f"X:{x_dev:+.2f}", (4, by_t),
+                    self.FONT, 0.60, xc, 2)
 
-        raw_dets = []
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            conf = float(box.conf[0])
-            raw_dets.append(Detection(x1, y1, x2, y2, conf))
+        dist_err = h_ratio - CFG.TARGET_H
+        dc = self.C_ORANGE if abs(dist_err) > CFG.HTOL else self.C_GREEN
+        cv2.putText(out, f"H:{h_ratio:.2f}(T:{CFG.TARGET_H:.2f})",
+                    (110, by_t), self.FONT, 0.55, dc, 2)
 
-        # ── DeepSORT tracking ────────────────────────────────────────────
-        if self.tracker is not None:
-            ds_input = [
-                ([d.x1, d.y1, d.width, d.height], d.confidence, "person")
-                for d in raw_dets
-            ]
-            tracks = self.tracker.update_tracks(ds_input, frame=frame)
-            confirmed = [t for t in tracks if t.is_confirmed()]
+        d_col = self.DIR_COLOR.get(direction, self.C_YELLOW)
+        (dw, _), _ = cv2.getTextSize(direction, self.FONT, 0.72, 2)
+        cv2.putText(out, direction, (W//2 - dw//2, by_t),
+                    self.FONT, 0.72, d_col, 2)
 
-            if not confirmed:
-                self._lost_frames += 1
-                if self._lost_frames > self._LOST_THRESHOLD:
-                    self._locked_id = -1
-                return None
+        info = f"{speed_pct:.0f}%  Sonar:{sonar_cm:.0f}cm"
+        (iw, _), _ = cv2.getTextSize(info, self.FONT, 0.55, 2)
+        cv2.putText(out, info, (W-iw-4, by_t),
+                    self.FONT, 0.55, self.C_WHITE, 2)
 
-            # Build Detection objects from confirmed tracks
-            tracked_dets = []
-            for t in confirmed:
-                ltrb = t.to_ltrb()
-                d = Detection(ltrb[0], ltrb[1], ltrb[2], ltrb[3],
-                              confidence=1.0, track_id=t.track_id)
-                tracked_dets.append(d)
-
-            # Lock onto a target
-            if self._locked_id == -1:
-                # Pick best first candidate
-                best = max(tracked_dets,
-                           key=lambda d: self._score_detection(d, fh))
-                self._locked_id = best.track_id
-                log.info(f"Locked onto track_id={self._locked_id}")
-
-            # Try to find our locked target
-            target = next((d for d in tracked_dets
-                           if d.track_id == self._locked_id), None)
-
-            if target is None:
-                self._lost_frames += 1
-                if self._lost_frames > self._LOST_THRESHOLD:
-                    self._locked_id = -1
-                    log.info("Target lost — searching for new child.")
-                return None
-
-            self._lost_frames = 0
-            return target
-
-        # ── Fallback: nearest-centroid (no DeepSORT) ─────────────────────
-        best = max(raw_dets, key=lambda d: self._score_detection(d, fh))
-        self._lost_frames = 0
-        return best
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. NAVIGATOR  (fuses perception + PID + motor commands)
+# NAVIGATOR  — main control loop
 # ═══════════════════════════════════════════════════════════════════════════
 class Navigator:
     """
-    Main navigation loop.
+    FOLLOW LOGIC — forward-only, sonar is the only stop trigger:
+    ─────────────────────────────────────────────────────────────────────
+    Every frame:
+      x_dev    = cx_norm - 0.5          left/right offset (-0.5 … +0.5)
+      h_ratio  = bbox_height / frame_H  distance proxy    (0 … 1)
+      dist_err = h_ratio - TARGET_H     + = too close (large box)
+                                        - = too far   (small box)
 
-    Angular PID:
-      setpoint = frame center (0.5)
-      measurement = child cx / frame_width
-      output → steering (angular command)
+    Decision tree (evaluated top to bottom, stops on first match):
+      1. sonar ≤ STOP_CM              → SONAR STOP  (absolute safety)
+      2. No target detected           → SPIN to search
+      3. dist_err < -HTOL  (FAR)      → FORWARD  (+ lean if x_dev off-centre)
+      4. dist_err > +HTOL  (NEAR)     → TOO CLOSE → stop & wait
+      5. distance OK  (±HTOL)
+           |x_dev| > TOL              → TURN LEFT / TURN RIGHT (in-place)
+           else                       → AT TARGET  (hold position, stop motors)
 
-    Linear PID:
-      setpoint = CFG.LIN_TARGET_RATIO   (desired box height as % of frame)
-      measurement = child box_height / frame_height
-      output → forward speed (linear command)
-
-    Hard stop: if ultrasonic ≤ STOP_DISTANCE_CM → stop motors immediately.
+    ⚠ The robot NEVER drives backward in any condition.
     """
 
     def __init__(self):
-        self.motor    = MotorController()
-        self.sonar    = UltrasonicSensor()
-        self.detector = ChildDetector()
+        log.info(f"Loading {CFG.MODEL} …")
+        self.yolo = YOLO(CFG.MODEL)
+        _d = np.zeros((CFG.INFER_SIZE, CFG.INFER_SIZE, 3), np.uint8)
+        self.yolo(_d, verbose=False)
+        log.info("YOLO ready.")
 
-        self.pid_ang = PID(CFG.ANG_KP, CFG.ANG_KI, CFG.ANG_KD,
-                           out_min=-1.0, out_max=1.0, name="Angular")
-        self.pid_lin = PID(CFG.LIN_KP, CFG.LIN_KI, CFG.LIN_KD,
-                           out_min=-1.0, out_max=1.0, name="Linear")
+        self.motors  = Motors()
+        self.sonar   = Sonar()
+        self.cam     = ThreadedCamera()
+        self.tracker = CentroidTracker()
+        self.hud     = HUD()
 
-        self._cap: Optional[cv2.VideoCapture] = None
-        self._running = False
+        self._skip_ctr   = 0
+        self._inf_ms     = 0.0
+        self._fps_buf    = deque(maxlen=12)
+        self._last_t     = time.monotonic()
+        self._search_dir = 1               # +1 = spin right, -1 = spin left
+        self._search_t   = time.monotonic()
 
-        # Stats
-        self._frame_count = 0
-        self._fps_start   = time.monotonic()
-
-    # ── Camera setup ─────────────────────────────────────────────────────
-    def _open_camera(self):
-        self._cap = cv2.VideoCapture(CFG.CAMERA_INDEX)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.FRAME_WIDTH)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.FRAME_HEIGHT)
-        self._cap.set(cv2.CAP_PROP_FPS,          CFG.TARGET_FPS)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # low latency
-        if not self._cap.isOpened():
-            raise RuntimeError("Cannot open camera!")
-        log.info(f"Camera opened (index={CFG.CAMERA_INDEX}).")
-
-    # ── HUD overlay ──────────────────────────────────────────────────────
-    def _draw_hud(self, frame: np.ndarray,
-                  det: Optional[Detection],
-                  linear: float, angular: float,
-                  dist_cm: float, fps: float) -> np.ndarray:
-        h, w = frame.shape[:2]
-        overlay = frame.copy()
-
-        # Frame centre crosshair
-        cv2.line(overlay, (w//2, 0), (w//2, h), (0, 255, 255), 1)
-
-        if det:
-            # Bounding box
-            x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            # Centroid
-            cv2.circle(overlay, (int(det.cx), int(det.cy)), 6, (0, 200, 0), -1)
-            label = f"Child #{det.track_id}  {det.confidence:.0%}"
-            cv2.putText(overlay, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-
-        # Stats panel
-        stats = [
-            f"FPS: {fps:.1f}",
-            f"Dist: {dist_cm:.1f} cm",
-            f"Lin: {linear:+.2f}",
-            f"Ang: {angular:+.2f}",
-        ]
-        if dist_cm <= CFG.STOP_DISTANCE_CM:
-            stats.append("!! HARD STOP !!")
-        for i, s in enumerate(stats):
-            color = (0, 0, 255) if "STOP" in s else (255, 255, 255)
-            cv2.putText(overlay, s, (8, 20 + i * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-        return cv2.addWeighted(overlay, 0.85, frame, 0.15, 0)
-
-    # ── One control tick ─────────────────────────────────────────────────
-    def _control_tick(self, det: Optional[Detection],
-                      frame_w: int, frame_h: int) -> Tuple[float, float]:
-        """
-        Returns (linear, angular) both in [-1, +1].
-        """
-        dist_cm = self.sonar.distance_cm
-
-        # ── Ultrasonic hard stop ─────────────────────────────────────────
-        if dist_cm <= CFG.STOP_DISTANCE_CM:
-            self.motor.stop()
-            self.pid_ang.reset()
-            self.pid_lin.reset()
-            return 0.0, 0.0
-
-        # ── No target → spin-search slowly ──────────────────────────────
-        if det is None:
-            self.motor.drive(linear=0.0, angular=0.3)   # gentle spin
-            return 0.0, 0.3
-
-        # ── Angular PID ──────────────────────────────────────────────────
-        cx_norm = det.cx / frame_w          # 0.0 (left) … 1.0 (right)
-        ang_error = cx_norm - 0.5           # <0 = child left, >0 = child right
-
-        if abs(ang_error) < CFG.ANG_DEADBAND:
-            angular = 0.0
-            self.pid_ang.reset()
-        else:
-            angular = self.pid_ang.compute(setpoint=0.5, measurement=cx_norm)
-
-        # ── Linear PID ───────────────────────────────────────────────────
-        # Slow down when also close per ultrasonic
-        speed_scale = 1.0
-        if dist_cm < CFG.SLOW_DISTANCE_CM:
-            t = (dist_cm - CFG.STOP_DISTANCE_CM) / (CFG.SLOW_DISTANCE_CM - CFG.STOP_DISTANCE_CM)
-            speed_scale = max(0.2, float(t))
-
-        h_ratio = det.height / frame_h
-        linear_raw = self.pid_lin.compute(
-            setpoint=CFG.LIN_TARGET_RATIO,
-            measurement=h_ratio,
+    # ── YOLO ──────────────────────────────────────────────────────────────
+    def _detect(self, frame: np.ndarray) -> Optional[Tuple]:
+        H, W = frame.shape[:2]
+        t0 = time.monotonic()
+        results = self.yolo(
+            frame, classes=[0], conf=CFG.CONF,
+            iou=CFG.IOU, imgsz=CFG.INFER_SIZE, verbose=False,
         )
-        linear = float(np.clip(linear_raw * speed_scale, -1.0, 1.0))
+        self._inf_ms = (time.monotonic() - t0) * 1000
 
-        # If child is far off-centre, reduce forward motion to turn first
-        if abs(ang_error) > 0.25:
-            linear *= max(0.0, 1.0 - abs(ang_error) * 1.5)
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
 
-        self.motor.drive(linear=linear, angular=angular)
-        return linear, angular
+        fcx, fcy = W / 2.0, H / 2.0
+        best, best_d = None, float('inf')
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            # Skip tiny detections (noise / very far people)
+            if (y2 - y1) / H < 0.08:
+                continue
+            # Pick person whose centroid is closest to frame centre
+            dist = math.hypot((x1+x2)/2 - fcx, (y1+y2)/2 - fcy)
+            if dist < best_d:
+                best_d = dist
+                best   = (x1/W, y1/H, x2/W, y2/H)
+        return best
 
-    # ── Main loop ────────────────────────────────────────────────────────
-    def run(self, show_preview: bool = True):
-        self._open_camera()
+    # ── Control decision ──────────────────────────────────────────────────
+    def _control(self,
+                 x_dev:      float,
+                 h_ratio:    float,
+                 has_target: bool,
+                 dist_cm:    float) -> Tuple[str, float]:
+        """
+        Returns (direction_label, speed_pct).
+        Drives motors directly.
+        Robot NEVER goes backward — sonar is the only stop.
+        """
+
+        # ── 1. SONAR HARD STOP (absolute safety, overrides everything) ────
+        if dist_cm <= CFG.STOP_CM:
+            self.motors.stop()
+            return "SONAR STOP", 0.0
+
+        # ── 2. No target → spin to search ─────────────────────────────────
+        if not has_target:
+            if self._search_dir > 0:
+                self.motors.spin_search_right(CFG.SEARCH_SPD)
+            else:
+                self.motors.spin_search_left(CFG.SEARCH_SPD)
+            return "SEARCHING", CFG.SEARCH_SPD
+
+        # dist_err: negative = person FAR (bbox too small)
+        #           positive = person NEAR (bbox too large)
+        dist_err = h_ratio - CFG.TARGET_H
+
+        # ── 3. Person is FAR → drive FORWARD ──────────────────────────────
+        #    Speed scales with distance gap (farther = faster up to FWD_SPD)
+        if dist_err < -CFG.HTOL:
+            gap  = abs(dist_err)                            # 0.06 … ~0.45
+            norm = min(gap / 0.30, 1.0)                    # 0 → 1
+            spd  = CFG.SLOW_SPD + norm * (CFG.FWD_SPD - CFG.SLOW_SPD)
+            spd  = float(np.clip(spd, CFG.MIN_SPD, CFG.FWD_SPD))
+
+            # Sonar soft-ramp: slow down as obstacle gets close
+            if dist_cm < CFG.SLOW_CM:
+                scale = max(0.35,
+                            (dist_cm - CFG.STOP_CM) /
+                            (CFG.SLOW_CM - CFG.STOP_CM))
+                spd *= scale
+                spd  = max(spd, CFG.MIN_SPD)
+
+            # Steer while moving forward (arc toward person)
+            if x_dev > CFG.TOLERANCE:
+                self.motors.forward_steer_right(spd)
+                return "FORWARD+R", spd
+            elif x_dev < -CFG.TOLERANCE:
+                self.motors.forward_steer_left(spd)
+                return "FORWARD+L", spd
+            else:
+                self.motors.forward(spd)
+                return "FORWARD", spd
+
+        # ── 4. Person is TOO CLOSE → stop and wait ─────────────────────────
+        #    Do NOT go backward — just stop. Person will presumably move.
+        elif dist_err > CFG.HTOL:
+            self.motors.stop()
+            return "TOO CLOSE", 0.0
+
+        # ── 5. Distance is OK → pure in-place steering or hold ────────────
+        else:
+            if x_dev > CFG.TOLERANCE:
+                self.motors.turn_right(CFG.TURN_SPD)
+                return "TURN RIGHT", CFG.TURN_SPD
+            elif x_dev < -CFG.TOLERANCE:
+                self.motors.turn_left(CFG.TURN_SPD)
+                return "TURN LEFT", CFG.TURN_SPD
+            else:
+                self.motors.stop()
+                return "AT TARGET", 0.0
+
+    # ── Main loop ─────────────────────────────────────────────────────────
+    def run(self):
         self.sonar.start()
-        self._running = True
+        log.info("Navigator running.  Press 'q' to quit.")
+        log.info(
+            f"CFG: TARGET_H={CFG.TARGET_H}  HTOL={CFG.HTOL}  "
+            f"TOL={CFG.TOLERANCE}  FWD={CFG.FWD_SPD}%  "
+            f"STOP={CFG.STOP_CM}cm"
+        )
+        log.info(
+            "★ CALIBRATION: Stand at follow distance. "
+            "Read H=x.xx on HUD. Set --target-h to that value."
+        )
 
-        log.info("Navigator started. Press 'q' to quit.")
-
-        linear, angular = 0.0, 0.0
-        fps = 0.0
+        cam_ms    = inf_ms = 0.0
+        fps       = 0.0
+        direction = "SEARCHING"
+        speed_pct = 0.0
+        status    = "NO OBJECT"
+        x_dev     = 0.0
+        h_ratio   = 0.0
 
         try:
-            while self._running:
-                t_loop = time.monotonic()
-
-                ret, frame = self._cap.read()
-                if not ret:
-                    log.warning("Dropped frame.")
+            while True:
+                ok, frame, cam_ms = self.cam.read()
+                if not ok or frame is None:
+                    time.sleep(0.005)
                     continue
 
-                fh, fw = frame.shape[:2]
+                # Detect / extrapolate
+                self._skip_ctr += 1
+                if self._skip_ctr > CFG.SKIP:
+                    self._skip_ctr = 0
+                    bbox_norm = self._detect(frame)
+                    self.tracker.update(bbox_norm)
+                    inf_ms = self._inf_ms
+                else:
+                    self.tracker.extrapolate()
+                    inf_ms = 0.0
 
-                # ── Detect & track ───────────────────────────────────────
-                det = self.detector.detect(frame)
+                bbox       = self.tracker.bbox
+                has_target = bbox is not None
 
-                # ── Control ──────────────────────────────────────────────
-                linear, angular = self._control_tick(det, fw, fh)
+                # Compute deviations
+                if has_target:
+                    cx_n    = (bbox[0] + bbox[2]) / 2
+                    h_ratio = bbox[3] - bbox[1]
+                    x_dev   = cx_n - 0.5
 
-                # ── FPS ──────────────────────────────────────────────────
-                self._frame_count += 1
-                elapsed = time.monotonic() - self._fps_start
-                if elapsed >= 1.0:
-                    fps = self._frame_count / elapsed
-                    self._frame_count = 0
-                    self._fps_start = time.monotonic()
+                    dist_err  = h_ratio - CFG.TARGET_H
+                    at_target = (abs(x_dev)   <= CFG.TOLERANCE and
+                                 abs(dist_err) <= CFG.HTOL)
+                    status = "AT TARGET" if at_target else "TRACKING"
+                else:
+                    x_dev   = 0.0
+                    h_ratio = 0.0
+                    status  = "NO OBJECT"
+                    # Alternate search direction every 3 s
+                    if time.monotonic() - self._search_t > 3.0:
+                        self._search_dir *= -1
+                        self._search_t    = time.monotonic()
 
-                # ── Preview window ───────────────────────────────────────
-                if show_preview:
-                    hud = self._draw_hud(frame, det, linear, angular,
-                                         self.sonar.distance_cm, fps)
-                    cv2.imshow("Child-Bot Navigator", hud)
+                # Execute control
+                direction, speed_pct = self._control(
+                    x_dev, h_ratio, has_target, self.sonar.cm
+                )
+
+                # FPS
+                now = time.monotonic()
+                dt  = now - self._last_t
+                self._last_t = now
+                if dt > 0:
+                    self._fps_buf.append(1.0 / dt)
+                fps = float(np.mean(self._fps_buf)) if self._fps_buf else 0.0
+
+                # Display
+                if CFG.SHOW:
+                    vis = self.hud.render(
+                        frame, bbox, x_dev, h_ratio,
+                        direction, speed_pct,
+                        fps, cam_ms, inf_ms,
+                        status, self.sonar.cm,
+                    )
+                    cv2.imshow("Child-Bot Navigator", vis)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
-                        log.info("User quit.")
+                        log.info("Quit.")
                         break
 
-                # ── Loop timing ──────────────────────────────────────────
-                elapsed_loop = time.monotonic() - t_loop
-                sleep_t = CFG.LOOP_DELAY_S - elapsed_loop
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
+                # Terminal log every YOLO tick
+                if self._skip_ctr == 0:
+                    dist_err = h_ratio - CFG.TARGET_H
+                    arrow = ("FAR→FORWARD" if dist_err < -CFG.HTOL else
+                             "NEAR→STOP"  if dist_err > CFG.HTOL  else
+                             "ON-TARGET")
+                    log.info(
+                        f"FPS={fps:.1f}  sonar={self.sonar.cm:.0f}cm  "
+                        f"X={x_dev:+.3f}  H={h_ratio:.3f}  "
+                        f"err={dist_err:+.3f}({arrow})  "
+                        f"→ {direction}  {speed_pct:.0f}%"
+                    )
 
         except KeyboardInterrupt:
-            log.info("KeyboardInterrupt — shutting down.")
+            log.info("Interrupted.")
         finally:
             self.shutdown()
 
     def shutdown(self):
-        self._running = False
-        self.motor.stop()
+        self.motors.stop()
         self.sonar.stop()
-        if self._cap:
-            self._cap.release()
+        self.cam.release()
         cv2.destroyAllWindows()
-        self.motor.cleanup()
-        log.info("Navigator shut down cleanly.")
+        self.motors.cleanup()
+        log.info("Shutdown complete.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7. ENTRY POINT
+# ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import argparse
+    ap = argparse.ArgumentParser(description="Child-Following Robot (Forward-Only)")
+    ap.add_argument("--no-display",  action="store_true")
+    ap.add_argument("--stop-dist",   type=float, default=CFG.STOP_CM,
+                    help=f"Sonar hard-stop cm (default {CFG.STOP_CM})")
+    ap.add_argument("--tolerance",   type=float, default=CFG.TOLERANCE,
+                    help=f"Left/right dead-zone (default {CFG.TOLERANCE})")
+    ap.add_argument("--target-h",    type=float, default=CFG.TARGET_H,
+                    help="Bbox height at ideal follow distance. "
+                         "Stand at target distance, read H=x.xx on HUD, "
+                         "use that value here.")
+    ap.add_argument("--htol",        type=float, default=CFG.HTOL,
+                    help=f"Distance dead-zone (default {CFG.HTOL})")
+    ap.add_argument("--fwd-spd",     type=float, default=CFG.FWD_SPD,
+                    help=f"Forward speed %% (default {CFG.FWD_SPD})")
+    ap.add_argument("--skip",        type=int,   default=CFG.SKIP)
+    ap.add_argument("--model",       type=str,   default=CFG.MODEL)
+    args = ap.parse_args()
 
-    parser = argparse.ArgumentParser(description="Child-Following Robot")
-    parser.add_argument("--no-preview", action="store_true",
-                        help="Disable OpenCV window (headless mode)")
-    parser.add_argument("--stop-dist", type=float, default=CFG.STOP_DISTANCE_CM,
-                        help=f"Hard-stop distance in cm (default: {CFG.STOP_DISTANCE_CM})")
-    parser.add_argument("--model", type=str, default=CFG.YOLO_MODEL,
-                        help="YOLOv8 model file (yolov8n.pt recommended for Pi)")
-    args = parser.parse_args()
+    CFG.SHOW      = not args.no_display
+    CFG.STOP_CM   = args.stop_dist
+    CFG.TOLERANCE = args.tolerance
+    CFG.TARGET_H  = args.target_h
+    CFG.HTOL      = args.htol
+    CFG.FWD_SPD   = args.fwd_spd
+    CFG.SKIP      = args.skip
+    CFG.MODEL     = args.model
 
-    # Apply CLI overrides
-    CFG.STOP_DISTANCE_CM = args.stop_dist
-    CFG.YOLO_MODEL       = args.model
-
-    nav = Navigator()
-    nav.run(show_preview=not args.no_preview)
+    Navigator().run()
