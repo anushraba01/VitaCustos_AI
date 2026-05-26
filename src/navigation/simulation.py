@@ -32,7 +32,7 @@ sys.modules['RPi']       = MagicMock()
 sys.modules['RPi.GPIO']  = MagicMock()
 
 # Import core logic (GPIO_AVAILABLE will be False)
-from robot_main import (
+from navigation1 import (
     RobotState, Detection, CentroidTracker,
     SteeringController, CAMERA_WIDTH, CAMERA_HEIGHT,
     ZONE_SAFE_LEFT, ZONE_SAFE_RIGHT,
