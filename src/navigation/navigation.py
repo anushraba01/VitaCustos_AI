@@ -68,67 +68,41 @@ logging.basicConfig(
 log = logging.getLogger("ChildBot")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONFIGURATION  — tune TARGET_H first, everything else second
-# ═══════════════════════════════════════════════════════════════════════════
 class CFG:
-    # ── GPIO ──────────────────────────────────────────────────────────────
     IN1 = 17;  IN2 = 18;  ENA = 22
     IN3 = 23;  IN4 = 24;  ENB = 25
     TRIG = 5;  ECHO = 6
 
-    # ── Camera ────────────────────────────────────────────────────────────
     CAM_INDEX = 0
     CAM_W = 640;  CAM_H = 480;  CAM_FPS = 30
 
-    # ── YOLO ──────────────────────────────────────────────────────────────
     MODEL      = "yolov8n.pt"
     INFER_SIZE = 160
     CONF       = 0.45
     IOU        = 0.45
-    SKIP       = 2          # run YOLO every (SKIP+1) frames → 1-in-3
+    SKIP       = 2
 
-    # ── Steering dead-zone ────────────────────────────────────────────────
-    TOLERANCE = 0.12        # ±12% of frame width — increase to reduce jitter
+    TOLERANCE = 0.12
 
-    # ── Distance control via BBOX HEIGHT ─────────────────────────────────
-    #
-    #  ★ CALIBRATE THIS FIRST — see header instructions above ★
-    #  Typical values:
-    #    ~1.0 m away → h_ratio ≈ 0.45–0.55
-    #    ~1.5 m away → h_ratio ≈ 0.30–0.40
-    #    ~2.0 m away → h_ratio ≈ 0.20–0.28
-    #
-    #  If robot does NOT move forward → your h_ratio is ABOVE this value
-    #  → raise TARGET_H until the robot starts moving.
-    #
-    TARGET_H = 0.45         # ideal follow distance (bbox height fraction)
-    HTOL     = 0.06         # ±6% dead-zone — increase if robot oscillates
+    TARGET_H = 0.45
+    HTOL     = 0.06
 
-    # ── Lost track ────────────────────────────────────────────────────────
     LOST_LIMIT = 25
 
-    # ── Safety (ultrasonic) — ONLY thing that triggers stop ───────────────
-    STOP_CM = 50.0          # hard stop distance
-    SLOW_CM = 90.0          # begin ramping down speed before stop
+    STOP_CM = 50.0
+    SLOW_CM = 90.0
 
-    # ── Motor speeds (PWM duty cycle %) ───────────────────────────────────
     PWM_HZ    = 1000
-    FWD_SPD   = 65.0        # forward cruise speed %
-    TURN_SPD  = 55.0        # speed when turning in-place
-    SLOW_SPD  = 38.0        # speed when close to target distance
-    MIN_SPD   = 25.0        # below this → 0 (prevent stall)
+    FWD_SPD   = 65.0
+    TURN_SPD  = 55.0
+    SLOW_SPD  = 38.0
+    MIN_SPD   = 25.0
 
-    # ── Search ────────────────────────────────────────────────────────────
-    SEARCH_SPD = 35.0       # spin speed when person lost
+    SEARCH_SPD = 35.0
 
-    # ── Display ───────────────────────────────────────────────────────────
     SHOW = True
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# THREADED CAMERA
-# ═══════════════════════════════════════════════════════════════════════════
 class ThreadedCamera:
     def __init__(self):
         self._cap = cv2.VideoCapture(CFG.CAM_INDEX)
@@ -167,12 +141,9 @@ class ThreadedCamera:
         self._cap.release()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CENTROID TRACKER  (lightweight, no DeepSORT)
-# ═══════════════════════════════════════════════════════════════════════════
 class CentroidTracker:
     def __init__(self):
-        self.bbox: Optional[Tuple] = None   # (x1,y1,x2,y2) in 0-1
+        self.bbox: Optional[Tuple] = None
         self._vel  = np.zeros(4)
         self.lost  = 0
 
@@ -211,9 +182,6 @@ class CentroidTracker:
         return None if self.bbox is None else (self.bbox[3] - self.bbox[1])
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MOTORS  — forward-only policy (no backward ever)
-# ═══════════════════════════════════════════════════════════════════════════
 class Motors:
     """
     Forward-only motor control.
@@ -246,7 +214,7 @@ class Motors:
         """
         spd = float(np.clip(abs(spd), 0, 100))
         if ON_PI:
-            GPIO.output(CFG.IN1, GPIO.HIGH)   # ← FORWARD direction for left
+            GPIO.output(CFG.IN1, GPIO.HIGH)
             GPIO.output(CFG.IN2, GPIO.LOW)
             self._lp.ChangeDutyCycle(spd)
 
@@ -258,7 +226,7 @@ class Motors:
         """
         spd = float(np.clip(abs(spd), 0, 100))
         if ON_PI:
-            GPIO.output(CFG.IN3, GPIO.HIGH)   # ← FORWARD direction for right
+            GPIO.output(CFG.IN3, GPIO.HIGH)
             GPIO.output(CFG.IN4, GPIO.LOW)
             self._rp.ChangeDutyCycle(spd)
 
@@ -360,9 +328,6 @@ class Motors:
             log.info("GPIO cleaned up.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ULTRASONIC SENSOR
-# ═══════════════════════════════════════════════════════════════════════════
 class Sonar:
     _WIN = 5
 
@@ -415,9 +380,6 @@ class Sonar:
             return self._dist
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HUD RENDERER
-# ═══════════════════════════════════════════════════════════════════════════
 class HUD:
     C_BLUE   = (200,  80,  20)
     C_GREEN  = ( 50, 210,  50)
@@ -468,23 +430,18 @@ class HUD:
         ty = int(CFG.TOLERANCE * H)
         out = frame.copy()
 
-        # Crosshair
         cv2.line(out, (fcx, 0), (fcx, H), self.C_BLUE, 1, cv2.LINE_AA)
         cv2.line(out, (0, fcy), (W, fcy), self.C_BLUE, 1, cv2.LINE_AA)
 
-        # Tolerance box
         cv2.rectangle(out, (fcx-tx, fcy-ty), (fcx+tx, fcy+ty),
                       self.C_GREEN, 2)
 
-        # Target height line — where TARGET_H maps on screen
-        # A person filling TARGET_H of the frame has bbox bottom at roughly:
-        tgt_y = int(H * (1.0 - CFG.TARGET_H) / 2)  # approximate visual guide
+        tgt_y = int(H * (1.0 - CFG.TARGET_H) / 2)
         cv2.line(out, (0, tgt_y), (W, tgt_y), self.C_CYAN, 1, cv2.LINE_AA)
         cv2.line(out, (0, H - tgt_y), (W, H - tgt_y), self.C_CYAN, 1, cv2.LINE_AA)
         cv2.putText(out, f"TARGET H={CFG.TARGET_H:.2f}", (4, tgt_y - 4),
                     self.FONT, 0.38, self.C_CYAN, 1)
 
-        # Bounding box + centroid
         if bbox is not None:
             x1 = int(bbox[0]*W); y1 = int(bbox[1]*H)
             x2 = int(bbox[2]*W); y2 = int(bbox[3]*H)
@@ -493,11 +450,9 @@ class HUD:
             ocy = (y1+y2)//2
             cv2.circle(out, (ocx, ocy), 6, self.C_RED, -1)
             cv2.line(out, (ocx, ocy), (fcx, fcy), self.C_YELLOW, 1, cv2.LINE_AA)
-            # Show current h_ratio on bbox — use this for TARGET_H calibration
             cv2.putText(out, f"H={h_ratio:.2f}", (x1, y1-6),
                         self.FONT, 0.50, self.C_YELLOW, 2)
 
-        # TOP BAR
         cv2.rectangle(out, (0, 0), (W, self.BAR), self.C_BLACK, -1)
         ty_t = self.BAR - 10
         cv2.putText(out, f"FPS:{fps:.1f}", (4, ty_t),
@@ -509,7 +464,6 @@ class HUD:
         cv2.putText(out, status, (W-sw-6, ty_t),
                     self.FONT, 0.65, s_col, 2)
 
-        # BOTTOM BAR
         by0 = H - self.BAR
         cv2.rectangle(out, (0, by0), (W, H), self.C_BLACK, -1)
         by_t = H - 10
@@ -536,30 +490,8 @@ class HUD:
         return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NAVIGATOR  — main control loop
-# ═══════════════════════════════════════════════════════════════════════════
 class Navigator:
-    """
-    FOLLOW LOGIC — forward-only, sonar is the only stop trigger:
-    ─────────────────────────────────────────────────────────────────────
-    Every frame:
-      x_dev    = cx_norm - 0.5          left/right offset (-0.5 … +0.5)
-      h_ratio  = bbox_height / frame_H  distance proxy    (0 … 1)
-      dist_err = h_ratio - TARGET_H     + = too close (large box)
-                                        - = too far   (small box)
-
-    Decision tree (evaluated top to bottom, stops on first match):
-      1. sonar ≤ STOP_CM              → SONAR STOP  (absolute safety)
-      2. No target detected           → SPIN to search
-      3. dist_err < -HTOL  (FAR)      → FORWARD  (+ lean if x_dev off-centre)
-      4. dist_err > +HTOL  (NEAR)     → TOO CLOSE → stop & wait
-      5. distance OK  (±HTOL)
-           |x_dev| > TOL              → TURN LEFT / TURN RIGHT (in-place)
-           else                       → AT TARGET  (hold position, stop motors)
-
-    ⚠ The robot NEVER drives backward in any condition.
-    """
+   
 
     def __init__(self):
         log.info(f"Loading {CFG.MODEL} …")
@@ -578,10 +510,9 @@ class Navigator:
         self._inf_ms     = 0.0
         self._fps_buf    = deque(maxlen=12)
         self._last_t     = time.monotonic()
-        self._search_dir = 1               # +1 = spin right, -1 = spin left
+        self._search_dir = 1
         self._search_t   = time.monotonic()
 
-    # ── YOLO ──────────────────────────────────────────────────────────────
     def _detect(self, frame: np.ndarray) -> Optional[Tuple]:
         H, W = frame.shape[:2]
         t0 = time.monotonic()
@@ -599,17 +530,14 @@ class Navigator:
         best, best_d = None, float('inf')
         for box in boxes:
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            # Skip tiny detections (noise / very far people)
             if (y2 - y1) / H < 0.08:
                 continue
-            # Pick person whose centroid is closest to frame centre
             dist = math.hypot((x1+x2)/2 - fcx, (y1+y2)/2 - fcy)
             if dist < best_d:
                 best_d = dist
                 best   = (x1/W, y1/H, x2/W, y2/H)
         return best
 
-    # ── Control decision ──────────────────────────────────────────────────
     def _control(self,
                  x_dev:      float,
                  h_ratio:    float,
@@ -621,12 +549,10 @@ class Navigator:
         Robot NEVER goes backward — sonar is the only stop.
         """
 
-        # ── 1. SONAR HARD STOP (absolute safety, overrides everything) ────
         if dist_cm <= CFG.STOP_CM:
             self.motors.stop()
             return "SONAR STOP", 0.0
 
-        # ── 2. No target → spin to search ─────────────────────────────────
         if not has_target:
             if self._search_dir > 0:
                 self.motors.spin_search_right(CFG.SEARCH_SPD)
@@ -634,19 +560,14 @@ class Navigator:
                 self.motors.spin_search_left(CFG.SEARCH_SPD)
             return "SEARCHING", CFG.SEARCH_SPD
 
-        # dist_err: negative = person FAR (bbox too small)
-        #           positive = person NEAR (bbox too large)
         dist_err = h_ratio - CFG.TARGET_H
 
-        # ── 3. Person is FAR → drive FORWARD ──────────────────────────────
-        #    Speed scales with distance gap (farther = faster up to FWD_SPD)
         if dist_err < -CFG.HTOL:
-            gap  = abs(dist_err)                            # 0.06 … ~0.45
-            norm = min(gap / 0.30, 1.0)                    # 0 → 1
+            gap  = abs(dist_err)
+            norm = min(gap / 0.30, 1.0)
             spd  = CFG.SLOW_SPD + norm * (CFG.FWD_SPD - CFG.SLOW_SPD)
             spd  = float(np.clip(spd, CFG.MIN_SPD, CFG.FWD_SPD))
 
-            # Sonar soft-ramp: slow down as obstacle gets close
             if dist_cm < CFG.SLOW_CM:
                 scale = max(0.35,
                             (dist_cm - CFG.STOP_CM) /
@@ -654,7 +575,6 @@ class Navigator:
                 spd *= scale
                 spd  = max(spd, CFG.MIN_SPD)
 
-            # Steer while moving forward (arc toward person)
             if x_dev > CFG.TOLERANCE:
                 self.motors.forward_steer_right(spd)
                 return "FORWARD+R", spd
@@ -665,13 +585,10 @@ class Navigator:
                 self.motors.forward(spd)
                 return "FORWARD", spd
 
-        # ── 4. Person is TOO CLOSE → stop and wait ─────────────────────────
-        #    Do NOT go backward — just stop. Person will presumably move.
         elif dist_err > CFG.HTOL:
             self.motors.stop()
             return "TOO CLOSE", 0.0
 
-        # ── 5. Distance is OK → pure in-place steering or hold ────────────
         else:
             if x_dev > CFG.TOLERANCE:
                 self.motors.turn_right(CFG.TURN_SPD)
@@ -683,7 +600,6 @@ class Navigator:
                 self.motors.stop()
                 return "AT TARGET", 0.0
 
-    # ── Main loop ─────────────────────────────────────────────────────────
     def run(self):
         self.sonar.start()
         log.info("Navigator running.  Press 'q' to quit.")
@@ -712,7 +628,6 @@ class Navigator:
                     time.sleep(0.005)
                     continue
 
-                # Detect / extrapolate
                 self._skip_ctr += 1
                 if self._skip_ctr > CFG.SKIP:
                     self._skip_ctr = 0
@@ -726,7 +641,6 @@ class Navigator:
                 bbox       = self.tracker.bbox
                 has_target = bbox is not None
 
-                # Compute deviations
                 if has_target:
                     cx_n    = (bbox[0] + bbox[2]) / 2
                     h_ratio = bbox[3] - bbox[1]
@@ -740,17 +654,14 @@ class Navigator:
                     x_dev   = 0.0
                     h_ratio = 0.0
                     status  = "NO OBJECT"
-                    # Alternate search direction every 3 s
                     if time.monotonic() - self._search_t > 3.0:
                         self._search_dir *= -1
                         self._search_t    = time.monotonic()
 
-                # Execute control
                 direction, speed_pct = self._control(
                     x_dev, h_ratio, has_target, self.sonar.cm
                 )
 
-                # FPS
                 now = time.monotonic()
                 dt  = now - self._last_t
                 self._last_t = now
@@ -758,7 +669,6 @@ class Navigator:
                     self._fps_buf.append(1.0 / dt)
                 fps = float(np.mean(self._fps_buf)) if self._fps_buf else 0.0
 
-                # Display
                 if CFG.SHOW:
                     vis = self.hud.render(
                         frame, bbox, x_dev, h_ratio,
@@ -771,7 +681,6 @@ class Navigator:
                         log.info("Quit.")
                         break
 
-                # Terminal log every YOLO tick
                 if self._skip_ctr == 0:
                     dist_err = h_ratio - CFG.TARGET_H
                     arrow = ("FAR→FORWARD" if dist_err < -CFG.HTOL else
@@ -798,9 +707,6 @@ class Navigator:
         log.info("Shutdown complete.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Child-Following Robot (Forward-Only)")

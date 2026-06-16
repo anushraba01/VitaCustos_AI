@@ -91,7 +91,6 @@ CONFIG = {
     "bed_detection_auto": True,         
     "bed_iou_threshold": 0.45,         
 
-    #write your id and token of telegram
     "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "telegram_alert_cooldown": 60,     
@@ -274,7 +273,6 @@ class FallDetector:
         person_area = max(1, (px2 - px1) * (py2 - py1))
 
         for bx1, by1, bx2, by2 in self.bed_zones:
-            # Intersection
             ix1 = max(px1, bx1)
             iy1 = max(py1, by1)
             ix2 = min(px2, bx2)
@@ -314,7 +312,6 @@ class FallDetector:
         dx = hip_mid[0] - shoulder_mid[0]
         dy = hip_mid[1] - shoulder_mid[1]
 
-        # Angle from vertical (dy axis)
         angle = abs(np.degrees(np.arctan2(abs(dx), abs(dy) + 1e-6)))
         return angle
 
@@ -490,7 +487,6 @@ class FallDetector:
         x1, y1, x2, y2 = [int(v) for v in bbox]
         state = track.state
 
-        # Box color by state
         COLOR_MAP = {
             PersonState.STANDING:  (0, 200, 0),
             PersonState.CROUCHING: (0, 200, 200),
@@ -505,7 +501,6 @@ class FallDetector:
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-        # Label
         label = f"ID:{track.track_id} | {state.value.upper()}"
         if torso_angle is not None:
             label += f" | {torso_angle:.0f}°"

@@ -1,1034 +1,963 @@
-"""
-=============================================================================
-HUMAN FOLLOWING ROBOT — Production-Grade AI Robotics System
-=============================================================================
-Hardware:  Raspberry Pi 4 | L298N | 2× DC Motors | HC-SR04 | USB/Pi Camera
-Vision:    YOLOv8-nano (person class) → MediaPipe Pose fallback
-Motion:    PID-inspired differential steering | Smooth PWM ramping
-=============================================================================
-"""
+
+import time
+import threading
+import logging
+import math
+from collections import deque
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-import threading
-import time
-import queue
-import sys
-import signal
-import logging
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OPTIONAL IMPORTS (graceful degradation for development on non-Pi hardware)
-# ─────────────────────────────────────────────────────────────────────────────
 try:
     import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
+    ON_PI = True
 except ImportError:
-    GPIO_AVAILABLE = False
-    print("[WARN] RPi.GPIO not found – running in SIMULATION mode")
+    ON_PI = False
+    print("[WARN] RPi.GPIO not found — SIMULATION mode")
 
 try:
     from ultralytics import YOLO
-    YOLO_AVAILABLE = True
 except ImportError:
-    YOLO_AVAILABLE = False
-    print("[WARN] ultralytics not found – will use MediaPipe fallback")
+    raise SystemExit("Run:  pip install ultralytics")
 
-try:
-    import mediapipe as mp
-    MEDIAPIPE_AVAILABLE = True
-except ImportError:
-    MEDIAPIPE_AVAILABLE = False
-    print("[WARN] mediapipe not found – detection will be disabled")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("HFR")
-
-# =============================================================================
-# ██████╗ ██████╗ ███╗   ██╗███████╗████████╗ █████╗ ███╗   ██╗████████╗███████╗
-# ██╔════╝██╔═══██╗████╗  ██║██╔════╝╚══██╔══╝██╔══██╗████╗  ██║╚══██╔══╝██╔════╝
-# ██║     ██║   ██║██╔██╗ ██║███████╗   ██║   ███████║██╔██╗ ██║   ██║   ███████╗
-# ██║     ██║   ██║██║╚██╗██║╚════██║   ██║   ██╔══██║██║╚██╗██║   ██║   ╚════██║
-# ╚██████╗╚██████╔╝██║ ╚████║███████║   ██║   ██║  ██║██║ ╚████║   ██║   ███████║
-#  ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝
-# =============================================================================
-
-# ── GPIO Pin Mapping ──────────────────────────────────────────────────────────
-#   L298N Motor Driver (BCM numbering)
-#
-#   LEFT MOTOR                RIGHT MOTOR
-#   IN1 → GPIO 17             IN3 → GPIO 22
-#   IN2 → GPIO 27             IN4 → GPIO 23
-#   ENA → GPIO 18 (PWM)       ENB → GPIO 24 (PWM)
-#
-#   HC-SR04 Ultrasonic Sensor
-#   TRIG → GPIO 5             ECHO → GPIO 6
-# ─────────────────────────────────────────────────────────────────────────────
-PIN_LEFT_IN1    = 17
-PIN_LEFT_IN2    = 27
-PIN_LEFT_EN     = 18   # PWM – must be hardware PWM or software PWM capable
-
-PIN_RIGHT_IN3   = 22
-PIN_RIGHT_IN4   = 23
-PIN_RIGHT_EN    = 24   # PWM
-
-PIN_TRIG        = 5
-PIN_ECHO        = 6
-
-PWM_FREQUENCY   = 1000   # Hz — higher = smoother at low duty cycles
-
-# ── Camera ────────────────────────────────────────────────────────────────────
-CAMERA_INDEX        = 0
-CAMERA_WIDTH        = 640
-CAMERA_HEIGHT       = 480
-CAMERA_FPS_TARGET   = 30
-PROCESS_EVERY_N_FRAMES = 2    # skip frames for detection to save CPU
-
-# ── Detection ─────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH         = "yolov8n.pt"   # auto-downloaded on first run
-YOLO_CONFIDENCE_THRESH  = 0.45
-YOLO_IOU_THRESH         = 0.45
-YOLO_PERSON_CLASS_ID    = 0
-
-MEDIAPIPE_MIN_DETECTION_CONF = 0.6
-MEDIAPIPE_MIN_TRACKING_CONF  = 0.5
-
-# ── Tracking ──────────────────────────────────────────────────────────────────
-TRACKING_HISTORY_LEN    = 8    # frames of bbox history for smoothing
-TRACKING_TIMEOUT_SEC    = 1.5  # seconds before declaring target lost
-TRACKING_CONFIDENCE_DECAY = 0.15  # per-frame confidence decay when not detected
-MIN_CONFIDENCE_TO_ACT   = 0.3
-
-# ── Frame Zones (fractions of frame width) ───────────────────────────────────
-# |  LEFT_EXT | LEFT_SAFE | ← CENTER → | RIGHT_SAFE | RIGHT_EXT |
-ZONE_CENTER_LEFT    = 0.35   # centre zone left boundary
-ZONE_CENTER_RIGHT   = 0.65   # centre zone right boundary
-ZONE_SAFE_LEFT      = 0.20   # safe zone left boundary
-ZONE_SAFE_RIGHT     = 0.80   # safe zone right boundary
-# anything outside SAFE zones triggers turning
-
-# ── Distance Control ──────────────────────────────────────────────────────────
-DISTANCE_STOP_CM        = 40   # ultrasonic emergency stop
-DISTANCE_NEAR_CM        = 60   # slow down
-DISTANCE_OPTIMAL_CM     = 90   # ideal follow distance
-DISTANCE_FAR_CM         = 150  # full speed ahead
-
-BBOX_STOP_WIDTH_RATIO   = 0.65  # stop if bbox > 65% of frame width (too close)
-BBOX_NEAR_WIDTH_RATIO   = 0.45
-BBOX_OPTIMAL_WIDTH_RATIO = 0.28
-BBOX_FAR_WIDTH_RATIO    = 0.15  # human far – move faster
-
-ULTRASONIC_MEDIAN_SAMPLES = 5
-ULTRASONIC_MAX_RANGE_CM   = 300
-
-# ── Motor Speed Parameters ────────────────────────────────────────────────────
-SPEED_BASE          = 62    # % PWM duty cycle – forward cruise
-SPEED_NEAR          = 45    # slow down when human near
-SPEED_FAR           = 75    # speed up when human far
-SPEED_MIN           = 35    # minimum drive speed (below = stall risk)
-SPEED_MAX           = 85    # maximum speed cap
-
-# Differential steering
-TURN_SPEED_REDUCTION = 22   # reduce inner motor by this % for gentle turn
-TURN_SPEED_OUTER    = SPEED_BASE
-TURN_SPEED_INNER    = SPEED_BASE - TURN_SPEED_REDUCTION
-
-# Smooth ramping
-RAMP_STEP_SIZE      = 3     # % change per ramp tick
-RAMP_TICK_SEC       = 0.02  # seconds between ramp ticks
-
-# ── Filtering / Smoothing ─────────────────────────────────────────────────────
-CENTROID_EMA_ALPHA  = 0.25  # exponential moving average for centroid
-SPEED_EMA_ALPHA     = 0.20  # EMA for speed changes
-
-# ── Turn Cooldown ─────────────────────────────────────────────────────────────
-TURN_COOLDOWN_SEC   = 0.35  # minimum time between direction changes
-
-# ── FPS Watchdog ──────────────────────────────────────────────────────────────
-FPS_WATCHDOG_PERIOD = 5.0   # seconds
-FPS_MINIMUM         = 5.0   # below this → emergency stop
+log = logging.getLogger("ChildBot")
 
 
-# =============================================================================
-#  DATA STRUCTURES
-# =============================================================================
+class CFG:
+    IN1 = 17;  IN2 = 18;  ENA = 12
+    IN3 = 23;  IN4 = 24;  ENB = 19
+    TRIG = 5;  ECHO = 6
 
-@dataclass
-class Detection:
-    """Normalised bounding box + metadata for a detected person."""
-    cx: float          # centre x, 0.0–1.0
-    cy: float          # centre y, 0.0–1.0
-    w: float           # width  fraction, 0.0–1.0
-    h: float           # height fraction, 0.0–1.0
-    confidence: float  # 0.0–1.0
-    timestamp: float   # time.monotonic()
+    CAM_INDEX = 0
+    CAM_W = 640;  CAM_H = 480;  CAM_FPS = 30
 
+    MODEL      = "yolov8n.pt"
+    INFER_SIZE = 160            
+    CONF       = 0.45
+    IOU        = 0.45
+    SKIP       = 2              
 
-@dataclass
-class MotorCommand:
-    """PWM duty cycles for both motors."""
-    left: float  = 0.0
-    right: float = 0.0
+   
+    X_TOL = 0.12                
 
+    
+    STOP_CM   = 70.0           
+    RAMP_CM   = 120.0           
 
-@dataclass
-class RobotState:
-    """Shared mutable state – all fields protected by RLock."""
-    # Tracking
-    target: Optional[Detection]   = None
-    track_confidence: float       = 0.0
-    smoothed_cx: float            = 0.5
-    smoothed_cy: float            = 0.5
+   
+    MIN_FWD   = 35.0            
+    MAX_FWD   = 70.0            
 
-    # Distances
-    ultrasonic_cm: float          = ULTRASONIC_MAX_RANGE_CM
-    bbox_distance_mode: str       = "far"   # far | optimal | near | stop
+    TURN_MAX  = 22.0
 
-    # Motion
-    motor_cmd: MotorCommand       = field(default_factory=MotorCommand)
-    last_turn_time: float         = 0.0
-    current_direction: str        = "stop"  # stop | forward | left | right
+    EMA_ALPHA      = 0.18     
+    HYSTERESIS_N   = 5          
+    MAX_TURN_RATE  = 5.0        
+    VEL_FEEDFWD    = 0.08      
 
-    # System
-    running: bool                 = True
-    emergency_stop: bool          = False
-    frame_count: int              = 0
-    fps: float                    = 0.0
+   
+    FWD_EMA_ALPHA  = 0.35      
 
+    
+    STABLE_FRAMES  = 6
 
-# =============================================================================
-#  MOTOR CONTROLLER
-# =============================================================================
+    
+    LOST_LIMIT = 25
 
-class MotorController:
-    """
-    L298N dual H-bridge driver with smooth PWM ramping.
+   
+    PWM_HZ  = 1000
 
-    Wiring assumption (BCM):
-        Left  motor: IN1=17, IN2=27, ENA=18(PWM)
-        Right motor: IN3=22, IN4=23, ENB=24(PWM)
-    """
+    
+    ANG_KP = 0.65;  ANG_KI = 0.003;  ANG_KD = 0.08
+
+    
+    SHOW = True
+
+class ThreadedCamera:
+   
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._left_speed  = 0.0
-        self._right_speed = 0.0
-        self._target_left  = 0.0
-        self._target_right = 0.0
+        self._cap = cv2.VideoCapture(CFG.CAM_INDEX)
+        
+       
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.CAM_W)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.CAM_H)
+        self._cap.set(cv2.CAP_PROP_FPS,          CFG.CAM_FPS)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        
+       
+        self._cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  
+        
+        if not self._cap.isOpened():
+            raise RuntimeError("Cannot open camera!")
 
-        if GPIO_AVAILABLE:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-            for pin in (PIN_LEFT_IN1, PIN_LEFT_IN2, PIN_LEFT_EN,
-                        PIN_RIGHT_IN3, PIN_RIGHT_IN4, PIN_RIGHT_EN):
-                GPIO.setup(pin, GPIO.OUT)
-                GPIO.output(pin, GPIO.LOW)
+        self._frame:  Optional[np.ndarray] = None
+        self._cam_ms: float = 0.0
+        self._lock  = threading.Lock()
+        self._stop  = False
+        
+       
+        self._timeout_count = 0
+        self._frame_count = 0
+        self._last_log_t = time.monotonic()
 
-            self._pwm_left  = GPIO.PWM(PIN_LEFT_EN,  PWM_FREQUENCY)
-            self._pwm_right = GPIO.PWM(PIN_RIGHT_EN, PWM_FREQUENCY)
-            self._pwm_left.start(0)
-            self._pwm_right.start(0)
-        else:
-            self._pwm_left  = None
-            self._pwm_right = None
+        threading.Thread(target=self._loop, daemon=True).start()
+        time.sleep(0.30)
+        log.info("Camera thread started.")
 
-        # Start ramp thread
-        self._ramp_thread = threading.Thread(
-            target=self._ramp_loop, name="MotorRamp", daemon=True)
-        self._ramp_thread.start()
-        log.info("MotorController initialised.")
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def forward(self, left_pct: float, right_pct: float):
-        """Set both motors forward with independent speeds."""
-        self._set_direction_pins(
-            left_fwd=True, left_bwd=False,
-            right_fwd=True, right_bwd=False)
-        with self._lock:
-            self._target_left  = float(np.clip(left_pct,  0, SPEED_MAX))
-            self._target_right = float(np.clip(right_pct, 0, SPEED_MAX))
-
-    def stop(self):
-        """Smooth deceleration to zero."""
-        self._set_direction_pins(
-            left_fwd=False, left_bwd=False,
-            right_fwd=False, right_bwd=False)
-        with self._lock:
-            self._target_left  = 0.0
-            self._target_right = 0.0
-
-    def emergency_stop(self):
-        """Instant stop – bypass ramp."""
-        self.stop()
-        with self._lock:
-            self._left_speed  = 0.0
-            self._right_speed = 0.0
-        self._apply_pwm(0.0, 0.0)
-
-    def cleanup(self):
-        self.emergency_stop()
-        time.sleep(0.1)
-        if GPIO_AVAILABLE:
-            self._pwm_left.stop()
-            self._pwm_right.stop()
-            GPIO.cleanup()
-        log.info("MotorController cleaned up.")
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _set_direction_pins(self, left_fwd, left_bwd, right_fwd, right_bwd):
-        if not GPIO_AVAILABLE:
-            return
-        GPIO.output(PIN_LEFT_IN1,  GPIO.HIGH if left_fwd  else GPIO.LOW)
-        GPIO.output(PIN_LEFT_IN2,  GPIO.HIGH if left_bwd  else GPIO.LOW)
-        GPIO.output(PIN_RIGHT_IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
-        GPIO.output(PIN_RIGHT_IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
-
-    def _apply_pwm(self, left: float, right: float):
-        if GPIO_AVAILABLE:
-            self._pwm_left.ChangeDutyCycle(left)
-            self._pwm_right.ChangeDutyCycle(right)
-
-    def _ramp_loop(self):
-        """Continuously ramp actual speeds toward targets."""
-        while True:
-            with self._lock:
-                tl = self._target_left
-                tr = self._target_right
-                cl = self._left_speed
-                cr = self._right_speed
-
-            # Smooth step toward target
-            cl = self._step(cl, tl)
-            cr = self._step(cr, tr)
-
-            with self._lock:
-                self._left_speed  = cl
-                self._right_speed = cr
-
-            self._apply_pwm(cl, cr)
-            time.sleep(RAMP_TICK_SEC)
-
-    @staticmethod
-    def _step(current: float, target: float) -> float:
-        diff = target - current
-        if abs(diff) <= RAMP_STEP_SIZE:
-            return target
-        return current + RAMP_STEP_SIZE * (1 if diff > 0 else -1)
-
-
-# =============================================================================
-#  ULTRASONIC SENSOR
-# =============================================================================
-
-class UltrasonicSensor:
-    """HC-SR04 driver with median filtering and thread-safe polling."""
-
-    def __init__(self):
-        self._readings = deque(maxlen=ULTRASONIC_MEDIAN_SAMPLES)
-        self._lock = threading.Lock()
-        self._distance_cm = float(ULTRASONIC_MAX_RANGE_CM)
-
-        if GPIO_AVAILABLE:
-            GPIO.setup(PIN_TRIG, GPIO.OUT)
-            GPIO.setup(PIN_ECHO, GPIO.IN)
-            GPIO.output(PIN_TRIG, GPIO.LOW)
-            time.sleep(0.05)  # sensor settle
-
-        self._thread = threading.Thread(
-            target=self._poll_loop, name="Ultrasonic", daemon=True)
-        self._thread.start()
-        log.info("UltrasonicSensor initialised.")
-
-    def get_distance(self) -> float:
-        """Return smoothed distance in centimetres."""
-        with self._lock:
-            return self._distance_cm
-
-    def _measure_raw(self) -> float:
-        if not GPIO_AVAILABLE:
-            return float(ULTRASONIC_MAX_RANGE_CM)
-
-        GPIO.output(PIN_TRIG, GPIO.HIGH)
-        time.sleep(0.00001)
-        GPIO.output(PIN_TRIG, GPIO.LOW)
-
-        timeout = time.monotonic() + 0.05
-        while GPIO.input(PIN_ECHO) == 0:
-            if time.monotonic() > timeout:
-                return ULTRASONIC_MAX_RANGE_CM
-        pulse_start = time.monotonic()
-
-        timeout = time.monotonic() + 0.05
-        while GPIO.input(PIN_ECHO) == 1:
-            if time.monotonic() > timeout:
-                return ULTRASONIC_MAX_RANGE_CM
-        pulse_end = time.monotonic()
-
-        distance = (pulse_end - pulse_start) * 17150  # cm
-        return float(np.clip(distance, 2, ULTRASONIC_MAX_RANGE_CM))
-
-    def _poll_loop(self):
-        while True:
-            raw = self._measure_raw()
-            self._readings.append(raw)
-
-            if len(self._readings) >= 3:
-                median = float(np.median(list(self._readings)))
-                with self._lock:
-                    self._distance_cm = median
-
-            time.sleep(0.06)  # ~16 Hz – sufficient for safety
-
-
-# =============================================================================
-#  HUMAN DETECTOR
-# =============================================================================
-
-class HumanDetector:
-    """
-    Detects a single nearest human using:
-    1. YOLOv8-nano (person class only) – preferred
-    2. MediaPipe Pose                   – fallback
-
-    Returns a Detection in normalised frame coordinates.
-    """
-
-    def __init__(self):
-        self._yolo = None
-        self._mp_pose = None
-        self._detector_name = "none"
-
-        if YOLO_AVAILABLE:
+    def _loop(self):
+        """Robust camera read loop with error recovery."""
+        consecutive_fails = 0
+        max_consecutive_fails = 10
+        
+        while not self._stop:
             try:
-                self._yolo = YOLO(YOLO_MODEL_PATH)
-                # Warm-up
-                dummy = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-                self._yolo.predict(dummy, verbose=False)
-                self._detector_name = "yolov8n"
-                log.info("YOLO detector ready.")
+                t0 = time.monotonic()
+                ret, frame = self._cap.read()
+                
+                if ret and frame is not None:
+                    ms = (time.monotonic() - t0) * 1000
+                    with self._lock:
+                        self._frame = frame
+                        self._cam_ms = ms
+                        self._frame_count += 1
+                    
+                    consecutive_fails = 0  
+                else:
+                    consecutive_fails += 1
+                    self._timeout_count += 1
+                    
+                    
+                    if self._timeout_count % 30 == 0:
+                        log.warning(
+                            f"Camera timeout #{self._timeout_count} "
+                            f"(consecutive: {consecutive_fails}/{max_consecutive_fails})"
+                        )
+                    
+                
+                    if consecutive_fails >= max_consecutive_fails:
+                        log.error("Camera read failures exceeded limit — attempting recovery...")
+                        self._recover_camera()
+                        consecutive_fails = 0
+                    
+                   
+                    time.sleep(0.001)
+            
             except Exception as e:
-                log.warning(f"YOLO init failed: {e}")
+                consecutive_fails += 1
+                log.error(f"Camera exception: {e}")
+                if consecutive_fails >= max_consecutive_fails:
+                    log.error("Attempting camera recovery...")
+                    self._recover_camera()
+                    consecutive_fails = 0
+                time.sleep(0.005)
 
-        if self._yolo is None and MEDIAPIPE_AVAILABLE:
-            mp_module = mp.solutions.pose
-            self._mp_pose = mp_module.Pose(
-                static_image_mode=False,
-                model_complexity=0,
-                min_detection_confidence=MEDIAPIPE_MIN_DETECTION_CONF,
-                min_tracking_confidence=MEDIAPIPE_MIN_TRACKING_CONF,
-            )
-            self._detector_name = "mediapipe"
-            log.info("MediaPipe Pose detector ready.")
+    def _recover_camera(self):
+        """Attempt to recover from camera timeout/error."""
+        try:
+            self._cap.release()
+            time.sleep(0.1)
+            self._cap = cv2.VideoCapture(CFG.CAM_INDEX)
+            
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.CAM_W)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.CAM_H)
+            self._cap.set(cv2.CAP_PROP_FPS,          CFG.CAM_FPS)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+            self._cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            
+            if self._cap.isOpened():
+                log.info("Camera recovery successful.")
+            else:
+                log.error("Camera recovery failed — device may be disconnected.")
+        except Exception as e:
+            log.error(f"Camera recovery error: {e}")
 
-        if self._detector_name == "none":
-            log.error("No detector available! Install ultralytics or mediapipe.")
+    def read(self) -> Tuple[bool, Optional[np.ndarray], float]:
+        """Get latest frame (never blocks)."""
+        with self._lock:
+            if self._frame is None:
+                return False, None, 0.0
+            return True, self._frame.copy(), self._cam_ms
 
-    @property
-    def name(self) -> str:
-        return self._detector_name
-
-    def detect(self, frame: np.ndarray) -> Optional[Detection]:
-        """
-        Run detection on frame.  Returns the Detection for the largest
-        (nearest) person, or None if not found.
-        """
-        h, w = frame.shape[:2]
-        now = time.monotonic()
-
-        if self._yolo is not None:
-            return self._detect_yolo(frame, w, h, now)
-        elif self._mp_pose is not None:
-            return self._detect_mediapipe(frame, w, h, now)
-        return None
-
-    def _detect_yolo(self, frame, w, h, now) -> Optional[Detection]:
-        results = self._yolo.predict(
-            frame,
-            classes=[YOLO_PERSON_CLASS_ID],
-            conf=YOLO_CONFIDENCE_THRESH,
-            iou=YOLO_IOU_THRESH,
-            verbose=False,
-            imgsz=320,   # smaller input for speed
-        )
-        best: Optional[Detection] = None
-        best_area = 0.0
-
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                bw = (x2 - x1) / w
-                bh = (y2 - y1) / h
-                area = bw * bh
-                if area > best_area:
-                    best_area = area
-                    best = Detection(
-                        cx=(x1 + x2) / 2 / w,
-                        cy=(y1 + y2) / 2 / h,
-                        w=bw, h=bh,
-                        confidence=conf,
-                        timestamp=now,
-                    )
-        return best
-
-    def _detect_mediapipe(self, frame, w, h, now) -> Optional[Detection]:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self._mp_pose.process(rgb)
-        if not result.pose_landmarks:
-            return None
-
-        lm = result.pose_landmarks.landmark
-        xs = [p.x for p in lm]
-        ys = [p.y for p in lm]
-
-        x_min, x_max = max(0, min(xs)), min(1, max(xs))
-        y_min, y_max = max(0, min(ys)), min(1, max(ys))
-        bw = x_max - x_min
-        bh = y_max - y_min
-
-        # MediaPipe visibility as confidence proxy
-        conf = float(np.mean([p.visibility for p in lm]))
-
-        return Detection(
-            cx=(x_min + x_max) / 2,
-            cy=(y_min + y_max) / 2,
-            w=bw, h=bh,
-            confidence=conf,
-            timestamp=now,
-        )
+    def release(self):
+        """Cleanly shutdown camera thread."""
+        self._stop = True
+        time.sleep(0.1)
+        if self._cap.isOpened():
+            self._cap.release()
+        
+        elapsed = time.monotonic() - self._last_log_t
+        if self._frame_count > 0:
+            fps = self._frame_count / elapsed if elapsed > 0 else 0
+            log.info(f"Camera stats: {self._frame_count} frames @ {fps:.1f} fps, "
+                    f"{self._timeout_count} timeouts")
 
 
-# =============================================================================
-#  KALMAN-LIKE TRACKER  (lightweight 2D centroid tracker)
-# =============================================================================
 
-class CentroidTracker:
-    """
-    Maintains a smooth estimate of the tracked human's centroid
-    using an exponential moving average and temporal confidence decay.
+class KalmanCentroidTracker:
+    
 
-    Not a full Kalman filter, but provides the same key benefits:
-    - Smooth centroid motion
-    - Short-term occlusion handling
-    - Confidence-weighted updates
-    """
+    
+    _DT = 1.0 / 10.0
 
     def __init__(self):
-        self.cx = 0.5
-        self.cy = 0.5
-        self.confidence = 0.0
-        self.last_seen = 0.0
-        self._history: deque = deque(maxlen=TRACKING_HISTORY_LEN)
+        
+        self.kf = cv2.KalmanFilter(4, 2)
 
-    def update(self, det: Optional[Detection]) -> float:
-        """Update tracker. Returns current confidence."""
-        now = time.monotonic()
+        dt = self._DT
+        
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1,  0],
+            [0, 0, 0,  1]], dtype=np.float32)
 
-        if det is not None and det.confidence >= MIN_CONFIDENCE_TO_ACT:
-            # Blend new detection into smoothed estimate
-            alpha = CENTROID_EMA_ALPHA
-            self.cx = alpha * det.cx + (1 - alpha) * self.cx
-            self.cy = alpha * det.cy + (1 - alpha) * self.cy
+        
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]], dtype=np.float32)
 
-            # Confidence rises toward detection confidence
-            self.confidence = min(1.0,
-                self.confidence + (det.confidence - self.confidence) * 0.4)
+       
+        Q = np.eye(4, dtype=np.float32)
+        Q[0, 0] = Q[1, 1] = 1e-3  
+        Q[2, 2] = Q[3, 3] = 8e-3   
+        self.kf.processNoiseCov = Q
 
-            self._history.append((det.cx, det.cy))
-            self.last_seen = now
+       
+        R = np.eye(2, dtype=np.float32) * 5e-3
+        self.kf.measurementNoiseCov = R
+
+       
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
+
+        self.initialized = False
+        self.lost_frames = 0
+        self.last_raw_bbox: Optional[Tuple] = None
+
+    def update(self, bbox_norm: Optional[Tuple]) -> bool:
+       
+        if bbox_norm is not None:
+            cx = (bbox_norm[0] + bbox_norm[2]) / 2.0
+            cy = (bbox_norm[1] + bbox_norm[3]) / 2.0
+            self.last_raw_bbox = bbox_norm
+            self.lost_frames   = 0
+
+            if not self.initialized:
+                self.kf.statePre  = np.array(
+                    [cx, cy, 0.0, 0.0], dtype=np.float32).reshape(4, 1)
+                self.kf.statePost = self.kf.statePre.copy()
+                self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 0.1
+                self.initialized = True
+            else:
+                self.kf.predict()
+                meas = np.array([cx, cy], dtype=np.float32).reshape(2, 1)
+                self.kf.correct(meas)
 
         else:
-            # No detection – decay confidence
-            elapsed = now - self.last_seen
-            decay = TRACKING_CONFIDENCE_DECAY * (elapsed * 10)
-            self.confidence = max(0.0, self.confidence - decay)
+            self.lost_frames += 1
+            if not self.initialized:
+                return False
+            if self.lost_frames > CFG.LOST_LIMIT:
+                self.initialized   = False
+                self.last_raw_bbox = None
+                return False
+            self.kf.predict()
 
-            # Continue with last known position (inertia)
-
-        return self.confidence
-
-    def is_tracking(self) -> bool:
-        elapsed = time.monotonic() - self.last_seen
-        return (self.confidence >= MIN_CONFIDENCE_TO_ACT and
-                elapsed < TRACKING_TIMEOUT_SEC)
+        return self.initialized
 
     def reset(self):
-        self.cx = 0.5
-        self.cy = 0.5
-        self.confidence = 0.0
-        self.last_seen = 0.0
-        self._history.clear()
-
-
-# =============================================================================
-#  STEERING LOGIC
-# =============================================================================
-
-class SteeringController:
-    """
-    Converts (smoothed_cx, bbox_width, ultrasonic_dist) → MotorCommand.
-
-    Motion rules enforced here:
-    ✓ Forward priority                 ✓ No backward
-    ✓ Dead-zone centre (no micro-turn) ✓ Extreme zone: slow differential turn
-    ✓ Turn cooldown                    ✓ Distance-based speed scaling
-    ✓ Emergency stop
-    """
-
-    def __init__(self):
-        self._last_turn_time  = 0.0
-        self._last_direction  = "stop"
-        self._smooth_left     = 0.0
-        self._smooth_right    = 0.0
-
-    def compute(
-        self,
-        smoothed_cx: float,
-        bbox_w: float,
-        ultrasonic_cm: float,
-        tracking: bool,
-        emergency: bool,
-    ) -> Tuple[MotorCommand, str]:
-        """
-        Returns (MotorCommand, direction_label).
-        direction_label: 'stop' | 'forward' | 'left' | 'right'
-        """
-
-        # ── Safety overrides ─────────────────────────────────────────────────
-        if emergency or not tracking:
-            return MotorCommand(0, 0), "stop"
-
-        # ── Distance check ────────────────────────────────────────────────────
-        if ultrasonic_cm <= DISTANCE_STOP_CM:
-            return MotorCommand(0, 0), "stop"
-
-        if bbox_w >= BBOX_STOP_WIDTH_RATIO:
-            return MotorCommand(0, 0), "stop"
-
-        # ── Base speed from distance ──────────────────────────────────────────
-        base = self._distance_to_speed(bbox_w, ultrasonic_cm)
-
-        # ── Zone determination ────────────────────────────────────────────────
-        if smoothed_cx < ZONE_SAFE_LEFT:
-            direction = "left"
-        elif smoothed_cx > ZONE_SAFE_RIGHT:
-            direction = "right"
-        else:
-            direction = "forward"   # centre + safe zones → forward only
-
-        # ── Turn cooldown ─────────────────────────────────────────────────────
-        now = time.monotonic()
-        if direction != "forward":
-            # Only allow turn if cooldown elapsed OR direction changed
-            if (self._last_direction == direction and
-                    now - self._last_turn_time < TURN_COOLDOWN_SEC):
-                direction = "forward"  # suppress oscillation
-
-        # ── Compute motor speeds ──────────────────────────────────────────────
-        left, right = base, base
-
-        if direction == "left":
-            # Reduce left motor for gentle left turn
-            steer_factor = self._steer_factor(smoothed_cx, side="left")
-            left  = base * (1.0 - steer_factor)
-            right = base
-            self._last_turn_time = now
-
-        elif direction == "right":
-            steer_factor = self._steer_factor(smoothed_cx, side="right")
-            left  = base
-            right = base * (1.0 - steer_factor)
-            self._last_turn_time = now
-
-        self._last_direction = direction
-
-        # ── EMA smoothing on output speeds ────────────────────────────────────
-        alpha = SPEED_EMA_ALPHA
-        self._smooth_left  = alpha * left  + (1 - alpha) * self._smooth_left
-        self._smooth_right = alpha * right + (1 - alpha) * self._smooth_right
-
-        # Enforce minimum speed when moving (prevent stall)
-        def enforce_min(v):
-            return max(SPEED_MIN, v) if v > 0 else 0
-
-        return (
-            MotorCommand(
-                left  = enforce_min(self._smooth_left),
-                right = enforce_min(self._smooth_right),
-            ),
-            direction,
-        )
-
-    @staticmethod
-    def _distance_to_speed(bbox_w: float, ultrasonic_cm: float) -> float:
-        """Map proximity signals to a single forward speed."""
-        # Use whichever indicates closer range (more conservative)
-        bbox_speed = np.interp(
-            bbox_w,
-            [BBOX_FAR_WIDTH_RATIO, BBOX_OPTIMAL_WIDTH_RATIO, BBOX_NEAR_WIDTH_RATIO],
-            [SPEED_FAR,             SPEED_BASE,               SPEED_NEAR],
-        )
-        ultra_speed = np.interp(
-            ultrasonic_cm,
-            [DISTANCE_NEAR_CM, DISTANCE_OPTIMAL_CM, DISTANCE_FAR_CM],
-            [SPEED_NEAR,        SPEED_BASE,           SPEED_FAR],
-        )
-        return float(np.clip(min(bbox_speed, ultra_speed), SPEED_MIN, SPEED_MAX))
-
-    @staticmethod
-    def _steer_factor(cx: float, side: str) -> float:
-        """
-        How much to reduce inner motor speed.
-        More extreme position → stronger (but still gentle) turn.
-        Returns 0.0 – 0.45 (so minimum inner speed ≈ 55% of outer).
-        """
-        if side == "left":
-            # cx is in [0, ZONE_SAFE_LEFT)
-            deviation = ZONE_SAFE_LEFT - cx          # 0 → ZONE_SAFE_LEFT
-            norm = deviation / ZONE_SAFE_LEFT          # 0–1
-        else:
-            deviation = cx - ZONE_SAFE_RIGHT
-            norm = deviation / (1.0 - ZONE_SAFE_RIGHT)
-
-        return float(np.clip(norm * 0.45, 0.0, 0.45))
-
-
-# =============================================================================
-#  CAMERA THREAD
-# =============================================================================
-
-class CameraThread(threading.Thread):
-    """
-    Captures frames from the camera into a bounded queue.
-    Runs at camera native FPS; downstream threads pick up latest frame.
-    """
-
-    def __init__(self, state: RobotState):
-        super().__init__(name="Camera", daemon=True)
-        self._state = state
-        self._frame_q: queue.Queue = queue.Queue(maxsize=2)
-        self._cap: Optional[cv2.VideoCapture] = None
+        self.initialized   = False
+        self.lost_frames   = 0
+        self.last_raw_bbox = None
 
     @property
-    def frame_queue(self):
-        return self._frame_q
+    def cx(self) -> Optional[float]:
+        
+        if not self.initialized:
+            return None
+        return float(self.kf.statePost[0, 0])
 
-    def run(self):
-        self._cap = cv2.VideoCapture(CAMERA_INDEX)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        self._cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS_TARGET)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # minimal latency
+    @property
+    def cy(self) -> Optional[float]:
+        if not self.initialized:
+            return None
+        return float(self.kf.statePost[1, 0])
 
-        if not self._cap.isOpened():
-            log.error("Cannot open camera!")
-            self._state.running = False
-            return
+    @property
+    def vx(self) -> float:
+        
+        if not self.initialized:
+            return 0.0
+        return float(self.kf.statePost[2, 0])
 
-        log.info("Camera opened.")
-        while self._state.running:
-            ok, frame = self._cap.read()
-            if not ok:
-                log.warning("Frame read failed.")
-                time.sleep(0.05)
-                continue
+    @property
+    def vy(self) -> float:
+        if not self.initialized:
+            return 0.0
+        return float(self.kf.statePost[3, 0])
 
-            # Keep queue fresh – drop oldest frame if full
-            if self._frame_q.full():
-                try:
-                    self._frame_q.get_nowait()
-                except queue.Empty:
-                    pass
-            self._frame_q.put(frame)
-
-        self._cap.release()
-        log.info("Camera released.")
+    @property
+    def is_active(self) -> bool:
+        return self.initialized
 
 
-# =============================================================================
-#  DETECTION THREAD
-# =============================================================================
 
-class DetectionThread(threading.Thread):
-    """
-    Pulls frames from the camera queue, runs detection + tracking,
-    and writes smoothed centroid into shared state.
-    """
+class SmoothSteering:
+  
 
-    def __init__(self, state: RobotState, frame_queue: queue.Queue):
-        super().__init__(name="Detection", daemon=True)
-        self._state = state
-        self._fq = frame_queue
-        self._detector = HumanDetector()
-        self._tracker  = CentroidTracker()
-        self._frame_skip = 0
+    def __init__(self, pid: 'PID'):
+        self._pid         = pid
+        self._ema         = 0.0
+        self._hyst_count  = 0
+        self._turn_pct    = 0.0
 
-    def run(self):
-        log.info(f"Detection thread using: {self._detector.name}")
-        fps_counter = 0
-        fps_timer = time.monotonic()
+    def compute(self, x_dev_raw: float, kalman_vx: float) -> Tuple[float, str]:
+       
 
-        while self._state.running:
-            try:
-                frame = self._fq.get(timeout=0.5)
-            except queue.Empty:
-                continue
+        α = CFG.EMA_ALPHA
+        self._ema = α * x_dev_raw + (1.0 - α) * self._ema
 
-            self._frame_skip += 1
-            if self._frame_skip < PROCESS_EVERY_N_FRAMES:
-                continue
-            self._frame_skip = 0
+        x_effective = self._ema + CFG.VEL_FEEDFWD * kalman_vx
 
-            # ── Run detector ──────────────────────────────────────────────────
-            det = self._detector.detect(frame)
-            conf = self._tracker.update(det)
-            tracking = self._tracker.is_tracking()
+        if x_effective > CFG.X_TOL:
+            self._hyst_count = min(self._hyst_count + 1,
+                                   CFG.HYSTERESIS_N * 3)
+        elif x_effective < -CFG.X_TOL:
+            self._hyst_count = max(self._hyst_count - 1,
+                                   -CFG.HYSTERESIS_N * 3)
+        else:
+            self._hyst_count = int(self._hyst_count * 0.6)
 
-            # ── Write to shared state (atomic-ish update) ─────────────────────
-            self._state.target           = det
-            self._state.track_confidence = conf
-            self._state.smoothed_cx      = self._tracker.cx
-            self._state.smoothed_cy      = self._tracker.cy
+        gate_open = abs(self._hyst_count) >= CFG.HYSTERESIS_N
 
-            # ── FPS counter ───────────────────────────────────────────────────
-            fps_counter += 1
-            elapsed = time.monotonic() - fps_timer
-            if elapsed >= 1.0:
-                self._state.fps = fps_counter / elapsed
-                fps_counter = 0
-                fps_timer = time.monotonic()
+        if not gate_open:
+            self._pid.reset()
+            target_turn = 0.0
+            label = ""
+        else:
+            pid_out    = self._pid(x_effective)
+            target_turn = pid_out * CFG.TURN_MAX
+            label = "TurnR" if x_effective > 0 else "TurnL"
 
-            self._state.frame_count += 1
+        delta = target_turn - self._turn_pct
+        delta = float(np.clip(delta, -CFG.MAX_TURN_RATE, CFG.MAX_TURN_RATE))
+        self._turn_pct += delta
+
+        return self._turn_pct, label
+
+    def reset(self):
+        
+        self._ema        = 0.0
+        self._hyst_count = 0
+        self._turn_pct   = 0.0
+        self._pid.reset()
 
 
-# =============================================================================
-#  MOTOR CONTROL THREAD
-# =============================================================================
 
-class MotorThread(threading.Thread):
-    """
-    Reads shared state and issues smooth motor commands at ~30 Hz.
-    Implements:
-    - Steering decisions
-    - Emergency stop watchdog
-    - FPS health check
-    """
+class PID:
+    def __init__(self, kp, ki, kd, lo=-1.0, hi=1.0):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.lo, self.hi = lo, hi
+        self._i  = 0.0
+        self._pe = 0.0
+        self._pt = None
 
-    def __init__(self, state: RobotState, motors: MotorController):
-        super().__init__(name="MotorControl", daemon=True)
-        self._state   = state
-        self._motors  = motors
-        self._steerer = SteeringController()
-        self._last_fps_check = time.monotonic()
+    def reset(self):
+        self._i = 0.0;  self._pe = 0.0;  self._pt = None
 
-    def run(self):
-        log.info("Motor control thread started.")
-        while self._state.running:
-            s = self._state
-
-            # ── FPS watchdog ──────────────────────────────────────────────────
-            now = time.monotonic()
-            if now - self._last_fps_check > FPS_WATCHDOG_PERIOD:
-                if s.fps < FPS_MINIMUM and s.fps > 0:
-                    log.warning(f"FPS too low ({s.fps:.1f}) – emergency stop!")
-                    s.emergency_stop = True
-                self._last_fps_check = now
-
-            # ── Compute steering ──────────────────────────────────────────────
-            cmd, direction = self._steerer.compute(
-                smoothed_cx   = s.smoothed_cx,
-                bbox_w        = s.target.w if s.target else 0.0,
-                ultrasonic_cm = s.ultrasonic_cm,
-                tracking      = self._tracker_active(s),
-                emergency     = s.emergency_stop,
-            )
-
-            s.motor_cmd        = cmd
-            s.current_direction = direction
-
-            # ── Apply to motors ───────────────────────────────────────────────
-            if direction == "stop":
-                self._motors.stop()
-            else:
-                self._motors.forward(cmd.left, cmd.right)
-
-            time.sleep(0.033)   # ~30 Hz update rate
-
-    @staticmethod
-    def _tracker_active(s: RobotState) -> bool:
-        """True if we have a confident, recent detection."""
-        if s.target is None:
-            return False
-        age = time.monotonic() - s.target.timestamp
-        return (s.track_confidence >= MIN_CONFIDENCE_TO_ACT and
-                age < TRACKING_TIMEOUT_SEC)
+    def __call__(self, error: float) -> float:
+        now = time.monotonic()
+        dt  = (now - self._pt) if self._pt else 0.033
+        dt  = max(dt, 1e-4)
+        self._pt = now
+        self._i += error * dt
+        if abs(self.ki * self._i) > 0.4:
+            self._i *= 0.4 / abs(self.ki * self._i)
+        d = (error - self._pe) / dt
+        self._pe = error
+        return float(np.clip(
+            self.kp * error + self.ki * self._i + self.kd * d,
+            self.lo, self.hi))
 
 
-# =============================================================================
-#  DISPLAY / DEBUG THREAD  (optional, disable on headless Pi)
-# =============================================================================
+class Motors:
+  
 
-class DisplayThread(threading.Thread):
-    """Overlays telemetry on live camera feed for debugging."""
-
-    SHOW_DISPLAY = True  # Set False on headless Raspberry Pi
-
-    def __init__(self, state: RobotState, frame_queue: queue.Queue):
-        super().__init__(name="Display", daemon=True)
-        self._state = state
-        self._fq = frame_queue
-
-    def run(self):
-        if not self.SHOW_DISPLAY:
-            return
-        log.info("Display thread started.")
-        while self._state.running:
-            try:
-                frame = self._fq.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            self._draw_overlay(frame)
-            cv2.imshow("Human Following Robot", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                self._state.running = False
-                break
-            elif key == ord('e'):
-                self._state.emergency_stop = not self._state.emergency_stop
-
-        cv2.destroyAllWindows()
-
-    def _draw_overlay(self, frame: np.ndarray):
-        s = self._state
-        h, w = frame.shape[:2]
-
-        # Zone lines
-        for frac, color in [
-            (ZONE_SAFE_LEFT,   (0, 200, 255)),
-            (ZONE_CENTER_LEFT, (0, 255,   0)),
-            (ZONE_CENTER_RIGHT,(0, 255,   0)),
-            (ZONE_SAFE_RIGHT,  (0, 200, 255)),
-        ]:
-            x = int(frac * w)
-            cv2.line(frame, (x, 0), (x, h), color, 1)
-
-        # Target bounding box
-        if s.target:
-            d = s.target
-            x1 = int((d.cx - d.w / 2) * w)
-            y1 = int((d.cy - d.h / 2) * h)
-            x2 = int((d.cx + d.w / 2) * w)
-            y2 = int((d.cy + d.h / 2) * h)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"{d.confidence:.2f}",
-                        (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # Smoothed centroid
-        cx_px = int(s.smoothed_cx * w)
-        cy_px = int(s.smoothed_cy * h)
-        cv2.circle(frame, (cx_px, cy_px), 6, (255, 80, 0), -1)
-
-        # HUD
-        lines = [
-            f"Dir: {s.current_direction.upper()}",
-            f"L:{s.motor_cmd.left:.0f}% R:{s.motor_cmd.right:.0f}%",
-            f"Dist: {s.ultrasonic_cm:.0f}cm",
-            f"Conf: {s.track_confidence:.2f}",
-            f"FPS: {s.fps:.1f}",
-        ]
-        if s.emergency_stop:
-            lines.insert(0, "!! EMERGENCY STOP !!")
-            cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 220), 3)
-
-        for i, line in enumerate(lines):
-            cv2.putText(frame, line, (8, 22 + i * 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
-                        cv2.LINE_AA)
-
-
-# =============================================================================
-#  ROBOT — TOP-LEVEL ORCHESTRATOR
-# =============================================================================
-
-class HumanFollowingRobot:
-    """
-    Ties together all subsystems and manages lifecycle.
-
-    Architecture:
-        CameraThread  ──frame_q──► DetectionThread
-                                        │
-                              shared RobotState
-                                        │
-                                   MotorThread ──► MotorController
-                            UltrasonicSensor ──────►  (state.ultrasonic_cm)
-    """
+    MIN_DUTY = 3.0
 
     def __init__(self):
-        self._state   = RobotState()
-        self._motors  = MotorController()
-        self._sonar   = UltrasonicSensor()
+        self._lp = self._rp = None
+        self._L_prev = 0.0
+        self._R_prev = 0.0
+        self._ramp_limit = 8.0
+        
+        if ON_PI:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            for pin in [CFG.IN1, CFG.IN2, CFG.ENA,
+                        CFG.IN3, CFG.IN4, CFG.ENB]:
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            self._lp = GPIO.PWM(CFG.ENA, CFG.PWM_HZ)
+            self._rp = GPIO.PWM(CFG.ENB, CFG.PWM_HZ)
+            self._lp.start(0);  self._rp.start(0)
+            log.info("Motors GPIO ready (BCM 17/18/22 + 23/24/25).")
 
-        self._cam     = CameraThread(self._state)
-        self._detect  = DetectionThread(self._state, self._cam.frame_queue)
-        self._motor_t = MotorThread(self._state, self._motors)
+    def _L(self, spd: float):
+        
+        spd = float(np.clip(spd, -100, 100))
+        
+        delta = spd - self._L_prev
+        delta = float(np.clip(delta, -self._ramp_limit, self._ramp_limit))
+        spd = self._L_prev + delta
+        self._L_prev = spd
+        
+        if ON_PI:
+            GPIO.output(CFG.IN1, GPIO.HIGH if spd >= 0 else GPIO.LOW)
+            GPIO.output(CFG.IN2, GPIO.LOW  if spd >= 0 else GPIO.HIGH)
+            self._lp.ChangeDutyCycle(abs(spd))
 
-        # Separate small queue for display (avoid blocking detection)
-        self._disp_q: queue.Queue = queue.Queue(maxsize=2)
-        self._display = DisplayThread(self._state, self._cam.frame_queue)
+    def _R(self, spd: float):
+        """Set right motor speed with ramp limiting."""
+        spd = float(np.clip(spd, -100, 100))
+        
+        delta = spd - self._R_prev
+        delta = float(np.clip(delta, -self._ramp_limit, self._ramp_limit))
+        spd = self._R_prev + delta
+        self._R_prev = spd
+        
+        if ON_PI:
+            GPIO.output(CFG.IN3, GPIO.HIGH if spd >= 0 else GPIO.LOW)
+            GPIO.output(CFG.IN4, GPIO.LOW  if spd >= 0 else GPIO.HIGH)
+            self._rp.ChangeDutyCycle(abs(spd))
 
-        # Hook SIGINT / SIGTERM
-        signal.signal(signal.SIGINT,  self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+    def drive_fwd(self, fwd_pct: float, turn_pct: float):
+  
+        fwd_pct  = float(np.clip(fwd_pct,  0,    100))
+        turn_pct = float(np.clip(turn_pct, -100, 100))
+
+        base_fwd = fwd_pct
+        
+        
+        turn_ratio = abs(turn_pct) / 100.0
+        
+        if turn_pct > 0:
+            L = base_fwd + (turn_pct * 0.2)
+            R = base_fwd - (turn_pct * 1.2)
+            
+        elif turn_pct < 0:
+            L = base_fwd + (turn_pct * 1.2)
+            R = base_fwd - (turn_pct * 0.2)
+            
+        else:
+            L = base_fwd
+            R = base_fwd
+
+        max_wheel = max(abs(L), abs(R))
+        if max_wheel > 100.0:
+            scale = 100.0 / max_wheel
+            L *= scale
+            R *= scale
+        
+        def apply_deadband(spd: float) -> float:
+            if abs(spd) < self.MIN_DUTY:
+                return 0.0
+            elif spd > 0:
+                return max(spd, self.MIN_DUTY)
+            else:
+                return min(spd, -self.MIN_DUTY)
+        
+        L = apply_deadband(L)
+        R = apply_deadband(R)
+
+        self._L(L);  self._R(R)
+
+        if not ON_PI:
+            log.debug(f"[SIM] fwd={fwd_pct:.0f}% turn={turn_pct:+.0f}% "
+                      f"→ L={L:+.0f}%  R={R:+.0f}%")
+
+    def stop(self):
+        """Hard stop motors."""
+        self._L(0);  self._R(0)
+        self._L_prev = 0.0
+        self._R_prev = 0.0
+
+    def cleanup(self):
+        self.stop()
+        if ON_PI:
+            if self._lp: self._lp.stop()
+            if self._rp: self._rp.stop()
+            GPIO.cleanup()
+            log.info("GPIO cleaned up.")
+
+
+class Sonar:
+    _WIN = 5
+
+    def __init__(self):
+        self._dist = 999.0
+        self._lock = threading.Lock()
+        self._buf  = deque(maxlen=self._WIN)
+        self._run  = False
+        if ON_PI:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(CFG.TRIG, GPIO.OUT)
+            GPIO.setup(CFG.ECHO, GPIO.IN)
+            GPIO.output(CFG.TRIG, GPIO.LOW)
+            time.sleep(0.05)
+
+    def _ping(self) -> float:
+        if not ON_PI:
+            return 999.0
+        GPIO.output(CFG.TRIG, GPIO.HIGH)
+        time.sleep(1e-5)
+        GPIO.output(CFG.TRIG, GPIO.LOW)
+        t0 = time.monotonic()
+        while GPIO.input(CFG.ECHO) == 0:
+            if time.monotonic() - t0 > 0.04: return 999.0
+        s = time.monotonic()
+        while GPIO.input(CFG.ECHO) == 1:
+            if time.monotonic() - s  > 0.04: return 999.0
+        return (time.monotonic() - s) * 17150
+
+    def _loop(self):
+        while self._run:
+            d = self._ping()
+            if 2 < d < 400:
+                self._buf.append(d)
+                with self._lock:
+                    self._dist = float(np.median(self._buf))
+            time.sleep(0.08)
 
     def start(self):
-        log.info("=" * 60)
-        log.info("   Human Following Robot — STARTING")
-        log.info("=" * 60)
+        self._run = True
+        threading.Thread(target=self._loop, daemon=True).start()
 
-        self._cam.start()
-        self._detect.start()
-        self._motor_t.start()
-        self._display.start()
+    def stop(self):
+        self._run = False
 
-        # Main thread: poll ultrasonic sensor and update state
-        log.info("Main loop running. Press Ctrl-C or Q to stop.")
+    @property
+    def cm(self) -> float:
+        with self._lock:
+            return self._dist
+
+
+class HUD:
+    C_BLUE   = (200,  80,  20)
+    C_GREEN  = ( 50, 210,  50)
+    C_YELLOW = (  0, 210, 210)
+    C_RED    = (  0,   0, 210)
+    C_WHITE  = (235, 235, 235)
+    C_BLACK  = (  0,   0,   0)
+    C_ORANGE = ( 20, 140, 255)
+    C_GREY   = (160, 160, 160)
+    C_PURPLE = (200,  50, 200)
+
+    STATUS_COL = {
+        "WAITING":   (160, 160, 160),
+        "TRACKING":  ( 20, 190, 255),
+        "ACQUIRED":  ( 40, 200,  40),
+        "OBSTACLE":  (  0,   0, 220),
+    }
+
+    BAR  = 38
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+    def render(self,
+               frame:        np.ndarray,
+               raw_bbox:     Optional[Tuple],
+               kalman_cx:    Optional[float],
+               kalman_cy:    Optional[float],
+               x_dev_raw:    float,
+               x_dev_smooth: float,
+               stable_pct:   float,
+               dist_cm:      float,
+               direction:    str,
+               fwd_pct:      float,
+               turn_pct:     float,
+               fps:          float,
+               cam_ms:       float,
+               inf_ms:       float,
+               oth_ms:       float,
+               status:       str) -> np.ndarray:
+
+        H, W = frame.shape[:2]
+        fcx, fcy = W // 2, H // 2
+        tx = int(CFG.X_TOL * W)
+        ty = int(CFG.X_TOL * H)
+
+        out = frame.copy()
+
+        cv2.line(out, (fcx, 0),  (fcx, H), self.C_BLUE, 1, cv2.LINE_AA)
+        cv2.line(out, (0,  fcy), (W,  fcy), self.C_BLUE, 1, cv2.LINE_AA)
+
+        cv2.rectangle(out, (fcx-tx, fcy-ty), (fcx+tx, fcy+ty), self.C_GREEN, 2)
+
+        if raw_bbox is not None:
+            x1 = int(raw_bbox[0]*W);  y1 = int(raw_bbox[1]*H)
+            x2 = int(raw_bbox[2]*W);  y2 = int(raw_bbox[3]*H)
+            cv2.rectangle(out, (x1, y1), (x2, y2), self.C_GREY, 1)
+
+        if kalman_cx is not None and kalman_cy is not None:
+            kcx = int(kalman_cx * W)
+            kcy = int(kalman_cy * H)
+            cv2.circle(out, (kcx, kcy), 8, self.C_YELLOW, -1)
+            cv2.circle(out, (kcx, kcy), 8, self.C_WHITE,   2)
+            cv2.line(out, (kcx, kcy), (fcx, fcy), self.C_YELLOW, 1, cv2.LINE_AA)
+
+        bar_max_h = H - 2*self.BAR
+        if dist_cm < 999:
+            ratio = max(0.0, min(1.0,
+                (dist_cm - CFG.STOP_CM) / max(1, CFG.RAMP_CM - CFG.STOP_CM)))
+            bh    = int(ratio * bar_max_h)
+            bar_x = W - 18
+            cv2.rectangle(out, (bar_x, self.BAR),
+                          (bar_x+14, self.BAR+bar_max_h), (40,40,40), -1)
+            b_col = self.C_GREEN if ratio > 0.4 else self.C_ORANGE
+            cv2.rectangle(out,
+                          (bar_x, self.BAR+bar_max_h-bh),
+                          (bar_x+14, self.BAR+bar_max_h), b_col, -1)
+            cv2.putText(out, f"{dist_cm:.0f}", (bar_x-2, self.BAR+bar_max_h+14),
+                        self.FONT, 0.38, self.C_WHITE, 1)
+
+        if status == "WAITING" and stable_pct > 0:
+            sb_h   = int(stable_pct * bar_max_h)
+            sb_x   = 4
+            cv2.rectangle(out, (sb_x, self.BAR),
+                          (sb_x+10, self.BAR+bar_max_h), (30,30,30), -1)
+            cv2.rectangle(out,
+                          (sb_x, self.BAR+bar_max_h-sb_h),
+                          (sb_x+10, self.BAR+bar_max_h), self.C_PURPLE, -1)
+
+        cv2.rectangle(out, (0,0), (W, self.BAR), self.C_BLACK, -1)
+        ty_t = self.BAR - 10
+        cv2.putText(out, f"FPS:{fps:.1f}", (6, ty_t),
+                    self.FONT, 0.68, self.C_WHITE, 2)
+        cv2.putText(out,
+                    f"Cam:{cam_ms:.0f}ms  Inf:{inf_ms:.0f}ms  Oth:{oth_ms:.0f}ms",
+                    (115, ty_t), self.FONT, 0.48, self.C_GREY, 1)
+        s_col = self.STATUS_COL.get(status, self.C_WHITE)
+        (sw, _), _ = cv2.getTextSize(status, self.FONT, 0.68, 2)
+        cv2.putText(out, status, (W-sw-22, ty_t), self.FONT, 0.68, s_col, 2)
+
+        cv2.rectangle(out, (0, H-self.BAR), (W, H), self.C_BLACK, -1)
+        by_t = H - 10
+
+        xc = self.C_ORANGE if abs(x_dev_smooth) > CFG.X_TOL else self.C_GREEN
+        cv2.putText(out, f"X:{x_dev_smooth:+.3f}({x_dev_raw:+.2f})",
+                    (6, by_t), self.FONT, 0.52, xc, 1)
+
+        sc = self.C_RED if dist_cm <= CFG.STOP_CM else (
+             self.C_ORANGE if dist_cm < CFG.RAMP_CM else self.C_GREEN)
+        cv2.putText(out, f"Sonar:{dist_cm:.0f}cm", (200, by_t),
+                    self.FONT, 0.60, sc, 2)
+
+        dir_col = self.C_PURPLE if status == "WAITING" else (
+                  self.C_RED    if "OBSTACLE" in direction else (
+                  self.C_GREEN  if direction == "Forward" else self.C_YELLOW))
+        (dw, _), _ = cv2.getTextSize(direction, self.FONT, 0.72, 2)
+        cv2.putText(out, direction, (W//2-dw//2, by_t),
+                    self.FONT, 0.72, dir_col, 2)
+
+        spd_str = f"Fwd:{fwd_pct:.0f}%  T:{turn_pct:+.0f}%"
+        (ssw, _), _ = cv2.getTextSize(spd_str, self.FONT, 0.55, 1)
+        cv2.putText(out, spd_str, (W-ssw-22, by_t),
+                    self.FONT, 0.55, self.C_WHITE, 1)
+
+        if status == "WAITING":
+            if stable_pct > 0:
+                msg = f"Acquiring... {int(stable_pct*100)}%"
+            else:
+                msg = "Waiting for person..."
+            (mw, mh), _ = cv2.getTextSize(msg, self.FONT, 0.75, 2)
+            mx = (W - mw) // 2
+            my = H // 2 - 20
+            cv2.rectangle(out, (mx-8, my-mh-6), (mx+mw+8, my+6),
+                          (30, 30, 30), -1)
+            cv2.putText(out, msg, (mx, my), self.FONT, 0.75, self.C_PURPLE, 2)
+
+        return out
+
+
+class Navigator:
+   
+
+    def __init__(self):
+        log.info(f"Loading {CFG.MODEL} …")
+        self.yolo = YOLO(CFG.MODEL)
+        self.yolo(np.zeros((CFG.INFER_SIZE, CFG.INFER_SIZE, 3), np.uint8),
+                  verbose=False)
+        log.info("YOLO ready.")
+
+        self.motors  = Motors()
+        self.sonar   = Sonar()
+        self.cam     = ThreadedCamera()
+        self.tracker = KalmanCentroidTracker()
+        self.hud     = HUD()
+
+        pid = PID(CFG.ANG_KP, CFG.ANG_KI, CFG.ANG_KD, lo=-1.0, hi=1.0)
+        self.steering = SmoothSteering(pid)
+
+        self._skip_ctr = 0
+        self._inf_ms   = 0.0
+        self._fps_buf: deque = deque(maxlen=15)
+        self._last_t   = time.monotonic()
+
+        self._stable_count  = 0
+        self._is_stable     = False
+
+        self._fwd_smooth = 0.0
+
+    def _detect(self, frame: np.ndarray) -> Optional[Tuple]:
+        """Return best bbox (x1,y1,x2,y2) normalised 0–1, or None."""
+        H, W = frame.shape[:2]
+        t0   = time.monotonic()
+        res  = self.yolo(frame, classes=[0], conf=CFG.CONF, iou=CFG.IOU,
+                         imgsz=CFG.INFER_SIZE, verbose=False)
+        self._inf_ms = (time.monotonic() - t0) * 1000
+
+        boxes = res[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        fcx = W / 2.0;  fcy = H / 2.0
+        best = None;  best_d = float('inf')
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            if (y2 - y1) / H < 0.08:
+                continue
+            d = math.hypot((x1+x2)/2 - fcx, (y1+y2)/2 - fcy)
+            if d < best_d:
+                best_d = d
+                best = (x1/W, y1/H, x2/W, y2/H)
+        return best
+
+    def _update_stability(self, detected: bool):
+        
+        if detected:
+            self._stable_count = min(self._stable_count + 1,
+                                     CFG.STABLE_FRAMES)
+        else:
+            self._stable_count = max(self._stable_count - 1, 0)
+
+        self._is_stable = (self._stable_count >= CFG.STABLE_FRAMES)
+
+    def _fwd_from_sonar(self, dist_cm: float) -> float:
+       
+        if dist_cm <= CFG.STOP_CM:
+            target = 0.0
+        elif dist_cm >= CFG.RAMP_CM:
+            target = CFG.MAX_FWD
+        else:
+            ratio  = (dist_cm - CFG.STOP_CM) / (CFG.RAMP_CM - CFG.STOP_CM)
+            target = CFG.MIN_FWD + ratio * (CFG.MAX_FWD - CFG.MIN_FWD)
+
+        α = CFG.FWD_EMA_ALPHA
+        self._fwd_smooth = α * target + (1.0 - α) * self._fwd_smooth
+        return self._fwd_smooth
+
+    def _control(self,
+                 kalman_cx:    Optional[float],
+                 kalman_vx:    float,
+                 has_target:   bool,
+                 dist_cm:      float) -> Tuple[str, float, float, str]:
+       
+        if not self._is_stable:
+            self.steering.reset()
+            self._fwd_smooth = 0.0
+            self.motors.stop()
+            return "Waiting...", 0.0, 0.0, "WAITING"
+
+        if not has_target:
+            self.steering.reset()
+            self._fwd_smooth = 0.0
+            self.motors.stop()
+            return "Lost target", 0.0, 0.0, "WAITING"
+
+        if dist_cm <= CFG.STOP_CM:
+            self.motors.stop()
+            self.steering.reset()
+            self._fwd_smooth = 0.0
+            return "OBSTACLE!", 0.0, 0.0, "OBSTACLE"
+
+
+        x_dev_raw = (kalman_cx - 0.5) if kalman_cx is not None else 0.0
+
+        turn_pct, turn_lbl = self.steering.compute(x_dev_raw, kalman_vx)
+
+        fwd_pct = self._fwd_from_sonar(dist_cm)
+
+        turn_ratio = abs(turn_pct) / max(CFG.TURN_MAX, 1.0)
+        if turn_ratio > 0.5 and fwd_pct > CFG.MIN_FWD:
+            reduction = 0.20 * (turn_ratio - 0.5) / 0.5
+            fwd_pct = max(CFG.MIN_FWD, fwd_pct * (1.0 - reduction))
+
+        self.motors.drive_fwd(fwd_pct, turn_pct)
+
+        ema_x      = self.steering._ema
+        at_centre  = abs(ema_x) <= CFG.X_TOL
+        at_dist    = CFG.STOP_CM < dist_cm <= CFG.RAMP_CM
+        status     = "ACQUIRED" if (at_centre and at_dist) else "TRACKING"
+
+        if turn_lbl:
+            if fwd_pct > CFG.MIN_FWD:
+                direction = f"Fwd+{turn_lbl}"
+            else:
+                direction = f"Turn {'R' if turn_pct > 0 else 'L'}"
+        else:
+            direction = "Forward" if fwd_pct > 0 else "HOLD"
+
+        return direction, fwd_pct, turn_pct, status
+
+    def run(self):
+        self.sonar.start()
+        log.info("Navigator v7.0 running with improved turning response.")
+        log.info("  Differential drive with motor reversal activated.")
+        log.info(f"  Stability gate:  {CFG.STABLE_FRAMES} consecutive detections")
+        log.info(f"  Hysteresis:      {CFG.HYSTERESIS_N} frames before turning")
+        log.info(f"  Turn rate limit: {CFG.MAX_TURN_RATE}% per frame")
+        log.info(f"  EMA alpha:       {CFG.EMA_ALPHA} (x_dev)")
+        log.info(f"  Vel feed-fwd:    {CFG.VEL_FEEDFWD}")
+        log.info(f"  Hard stop:       sonar ≤ {CFG.STOP_CM:.0f} cm")
+        log.info(f"  Full speed:      sonar ≥ {CFG.RAMP_CM:.0f} cm → {CFG.MAX_FWD:.0f}%")
+        log.info("  Robot stands STILL until person is stably acquired.")
+
+        cam_ms = inf_ms = oth_ms = 0.0
+        fps = 0.0
+        fwd_pct = turn_pct = 0.0
+        direction = "WAITING"
+        status    = "WAITING"
+        x_dev_raw = 0.0
+
         try:
-            while self._state.running:
-                self._state.ultrasonic_cm = self._sonar.get_distance()
-                time.sleep(0.05)
+            while True:
+                ok, frame, cam_ms = self.cam.read()
+                if not ok or frame is None:
+                    time.sleep(0.005)
+                    continue
+
+                t_oth = time.monotonic()
+
+                self._skip_ctr += 1
+                run_yolo = self._skip_ctr > CFG.SKIP
+                if run_yolo:
+                    self._skip_ctr = 0
+                    raw_bbox = self._detect(frame)
+                    inf_ms   = self._inf_ms
+                else:
+                    raw_bbox = None
+                    inf_ms   = 0.0
+
+                if run_yolo:
+                    active = self.tracker.update(raw_bbox)
+                    self._update_stability(raw_bbox is not None)
+                else:
+                    active = self.tracker.update(None) if self.tracker.is_active else False
+
+                has_target = active and self.tracker.is_active
+                kalman_cx  = self.tracker.cx
+                kalman_cy  = self.tracker.cy
+                kalman_vx  = self.tracker.vx
+
+                x_dev_raw = (kalman_cx - 0.5) if kalman_cx is not None else 0.0
+
+                direction, fwd_pct, turn_pct, status = self._control(
+                    kalman_cx, kalman_vx, has_target, self.sonar.cm)
+
+                now = time.monotonic()
+                dt  = now - self._last_t
+                self._last_t = now
+                if dt > 0:
+                    self._fps_buf.append(1.0 / dt)
+                fps    = float(np.mean(self._fps_buf)) if self._fps_buf else 0.0
+                oth_ms = (time.monotonic() - t_oth) * 1000
+
+                if CFG.SHOW:
+                    stable_pct = self._stable_count / CFG.STABLE_FRAMES
+                    vis = self.hud.render(
+                        frame,
+                        self.tracker.last_raw_bbox,
+                        kalman_cx, kalman_cy,
+                        x_dev_raw,
+                        self.steering._ema,
+                        stable_pct,
+                        self.sonar.cm,
+                        direction, fwd_pct, turn_pct,
+                        fps, cam_ms, inf_ms, oth_ms, status,
+                    )
+                    cv2.imshow("Child-Bot Navigator v7", vis)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        log.info("Quit requested.")
+                        break
+
+                if run_yolo:
+                    log.info(
+                        f"FPS={fps:.1f}  sonar={self.sonar.cm:.0f}cm  "
+                        f"X_raw={x_dev_raw:+.4f}  X_ema={self.steering._ema:+.4f}  "
+                        f"vx={kalman_vx:+.4f}  stable={self._stable_count}/{CFG.STABLE_FRAMES}  "
+                        f"[{status}]  [{direction}]  "
+                        f"fwd={fwd_pct:.0f}%  turn={turn_pct:+.0f}%"
+                    )
+
+        except KeyboardInterrupt:
+            log.info("Interrupted.")
         finally:
             self.shutdown()
 
     def shutdown(self):
-        log.info("Shutting down…")
-        self._state.running = False
-        self._motors.emergency_stop()
-        time.sleep(0.3)
-        self._motors.cleanup()
-        log.info("Robot stopped cleanly.")
+        self.motors.stop()
+        self.sonar.stop()
+        self.cam.release()
+        cv2.destroyAllWindows()
+        self.motors.cleanup()
+        log.info("Shutdown complete.")
 
-    def _signal_handler(self, sig, frame):
-        log.info(f"Signal {sig} received.")
-        self._state.running = False
-
-
-# =============================================================================
-#  ENTRY POINT
-# =============================================================================
 
 if __name__ == "__main__":
-    robot = HumanFollowingRobot()
-    robot.start()
+    import argparse
+    ap = argparse.ArgumentParser(description="Child-Following Robot v7.0")
+    ap.add_argument("--no-display",   action="store_true", help="Headless mode")
+    ap.add_argument("--stop-dist",    type=float, default=CFG.STOP_CM)
+    ap.add_argument("--ramp-dist",    type=float, default=CFG.RAMP_CM)
+    ap.add_argument("--min-fwd",      type=float, default=CFG.MIN_FWD)
+    ap.add_argument("--max-fwd",      type=float, default=CFG.MAX_FWD)
+    ap.add_argument("--turn-max",     type=float, default=CFG.TURN_MAX)
+    ap.add_argument("--x-tol",        type=float, default=CFG.X_TOL)
+    ap.add_argument("--lost-limit",   type=int,   default=CFG.LOST_LIMIT)
+    ap.add_argument("--skip",         type=int,   default=CFG.SKIP)
+    ap.add_argument("--model",        type=str,   default=CFG.MODEL)
+    ap.add_argument("--stable",       type=int,   default=CFG.STABLE_FRAMES,
+                    help=f"Detections before moving (default {CFG.STABLE_FRAMES})")
+    ap.add_argument("--hysteresis",   type=int,   default=CFG.HYSTERESIS_N,
+                    help=f"Frames before turn commits (default {CFG.HYSTERESIS_N})")
+    ap.add_argument("--ema-alpha",    type=float, default=CFG.EMA_ALPHA,
+                    help=f"x_dev EMA weight 0-1 (default {CFG.EMA_ALPHA})")
+    ap.add_argument("--turn-rate",    type=float, default=CFG.MAX_TURN_RATE,
+                    help=f"Max turn change per frame (default {CFG.MAX_TURN_RATE})")
+    ap.add_argument("--vel-ff",       type=float, default=CFG.VEL_FEEDFWD,
+                    help=f"Kalman vx feed-forward gain (default {CFG.VEL_FEEDFWD})")
+    args = ap.parse_args()
+
+    CFG.SHOW           = not args.no_display
+    CFG.STOP_CM        = args.stop_dist
+    CFG.RAMP_CM        = args.ramp_dist
+    CFG.MIN_FWD        = args.min_fwd
+    CFG.MAX_FWD        = args.max_fwd
+    CFG.TURN_MAX       = args.turn_max
+    CFG.X_TOL          = args.x_tol
+    CFG.LOST_LIMIT     = args.lost_limit
+    CFG.SKIP           = args.skip
+    CFG.MODEL          = args.model
+    CFG.STABLE_FRAMES  = args.stable
+    CFG.HYSTERESIS_N   = args.hysteresis
+    CFG.EMA_ALPHA      = args.ema_alpha
+    CFG.MAX_TURN_RATE  = args.turn_rate
+    CFG.VEL_FEEDFWD    = args.vel_ff
+
+    Navigator().run()
